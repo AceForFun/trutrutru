@@ -16,7 +16,7 @@ private struct VKAudioItems: Decodable {
     let items: [AudioTrack]
 }
 
-private enum AppScreen {
+enum AppScreen {
     case auth
     case songs
 }
@@ -113,12 +113,14 @@ struct ContentView: View {
             }
             .navigationTitle(authStore.screen == .auth ? "Авторизация" : "Мои песни")
             .toolbar {
-                if authStore.screen == .songs {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button(action: { authStore.logout() }) {
-                            Image(systemName: "square.and.arrow.right")
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Group {
+                        if authStore.screen == .songs {
+                            Button(action: { authStore.logout() }) {
+                                Image(systemName: "square.and.arrow.right")
+                            }
+                            .accessibilityLabel("Выйти")
                         }
-                        .accessibilityLabel("Выйти")
                     }
                 }
             }
