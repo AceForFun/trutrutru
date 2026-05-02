@@ -16,13 +16,13 @@ private struct VKAudioItems: Decodable {
     let items: [AudioTrack]
 }
 
-private enum AppScreen {
+enum AppScreen {
     case auth
     case songs
 }
 
 final class VKAuthStore: ObservableObject {
-    @AppStorage("vk_access_token") private var storedToken: String = ""
+    private let tokenStorageKey = "vk_access_token"
 
     @Published var accessToken: String = ""
     @Published var tracks: [AudioTrack] = []
@@ -30,7 +30,7 @@ final class VKAuthStore: ObservableObject {
     @Published var errorMessage: String?
 
     init() {
-        accessToken = storedToken
+        accessToken = UserDefaults.standard.string(forKey: tokenStorageKey) ?? ""
     }
 
     var screen: AppScreen {
@@ -39,46 +39,61 @@ final class VKAuthStore: ObservableObject {
 
     func saveToken(_ token: String) {
         accessToken = token
-        storedToken = token
+        UserDefaults.standard.set(token, forKey: tokenStorageKey)
         errorMessage = nil
-        Task {
-            await fetchTracks()
-        }
+        fetchTracks()
     }
 
     func logout() {
         accessToken = ""
-        storedToken = ""
+        UserDefaults.standard.removeObject(forKey: tokenStorageKey)
         tracks = []
         errorMessage = nil
     }
 
-    @MainActor
-    func fetchTracks() async {
+    func fetchTracks() {
         guard !accessToken.isEmpty else {
             return
         }
 
         isLoading = true
-        defer { isLoading = false }
 
         let encodedToken = accessToken.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? accessToken
         let urlString = "https://api.vk.com/method/audio.get?access_token=\(encodedToken)&v=5.131"
 
         guard let url = URL(string: urlString) else {
+            isLoading = false
             errorMessage = "Некорректный URL для запроса аудио."
             return
         }
 
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let decoded = try JSONDecoder().decode(VKAudioResponse.self, from: data)
-            tracks = decoded.response.items
-            errorMessage = nil
-        } catch {
-            tracks = []
-            errorMessage = "Не удалось загрузить список песен: \(error.localizedDescription)"
-        }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isLoading = false
+
+                if let error = error {
+                    self.tracks = []
+                    self.errorMessage = "Не удалось загрузить список песен: \(error.localizedDescription)"
+                    return
+                }
+
+                guard let data = data else {
+                    self.tracks = []
+                    self.errorMessage = "Не удалось загрузить список песен: пустой ответ."
+                    return
+                }
+
+                do {
+                    let decoded = try JSONDecoder().decode(VKAudioResponse.self, from: data)
+                    self.tracks = decoded.response.items
+                    self.errorMessage = nil
+                } catch {
+                    self.tracks = []
+                    self.errorMessage = "Не удалось загрузить список песен: \(error.localizedDescription)"
+                }
+            }
+        }.resume()
     }
 }
 
@@ -98,22 +113,22 @@ struct ContentView: View {
             }
             .navigationTitle(authStore.screen == .auth ? "Авторизация" : "Мои песни")
             .toolbar {
-                if authStore.screen == .songs {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button {
-                            authStore.logout()
-                        } label: {
-                            Image(systemName: "rectangle.portrait.and.arrow.right")
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Group {
+                        if authStore.screen == .songs {
+                            Button(action: { authStore.logout() }) {
+                                Image(systemName: "square.and.arrow.right")
+                            }
+                            .accessibilityLabel("Выйти")
                         }
-                        .accessibilityLabel("Выйти")
                     }
                 }
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
-        .task {
+        .onAppear {
             if !authStore.accessToken.isEmpty && authStore.tracks.isEmpty {
-                await authStore.fetchTracks()
+                authStore.fetchTracks()
             }
         }
         .sheet(isPresented: $isShowingWebView) {
@@ -151,9 +166,7 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
                     Button("Повторить") {
-                        Task {
-                            await authStore.fetchTracks()
-                        }
+                        authStore.fetchTracks()
                     }
                 }
             } else if authStore.tracks.isEmpty {
