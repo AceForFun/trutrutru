@@ -132,10 +132,23 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $isShowingWebView) {
-            VKOAuthWebView { token in
-                isShowingWebView = false
-                authStore.saveToken(token)
+            NavigationView {
+                VKOAuthWebView { token in
+                    isShowingWebView = false
+                    authStore.saveToken(token)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationTitle("ВКонтакте")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Закрыть") {
+                            isShowingWebView = false
+                        }
+                    }
+                }
             }
+            .navigationViewStyle(StackNavigationViewStyle())
         }
     }
 
@@ -188,7 +201,8 @@ struct ContentView: View {
 }
 
 struct VKOAuthWebView: UIViewRepresentable {
-    private let authURLString = "https://oauth.vk.com/authorize?client_id=6463690&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=audio,offline&response_type=token&v=5.131"
+    /// display=mobile лучше подходит для WebView; redirect_uri должен совпадать с настройками приложения VK.
+    private let authURLString = "https://oauth.vk.com/authorize?client_id=6463690&display=mobile&redirect_uri=https://oauth.vk.com/blank.html&scope=audio,offline&response_type=token&v=5.131"
 
     let onTokenReceived: (String) -> Void
 
@@ -196,16 +210,38 @@ struct VKOAuthWebView: UIViewRepresentable {
         Coordinator(onTokenReceived: onTokenReceived)
     }
 
-    func makeUIView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero)
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView()
+        container.backgroundColor = .systemBackground
+
+        let config = WKWebViewConfiguration()
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        if #available(iOS 13.0, *) {
+            config.defaultWebpagePreferences.preferredContentMode = .mobile
+        }
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = context.coordinator
+        webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+
+        container.addSubview(webView)
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: container.topAnchor),
+            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
         if let url = URL(string: authURLString) {
             webView.load(URLRequest(url: url))
         }
-        return webView
+
+        return container
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {}
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         let onTokenReceived: (String) -> Void
