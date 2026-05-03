@@ -44,6 +44,14 @@ final class VKAuthStore: ObservableObject {
         fetchTracks()
     }
 
+    func saveTokenFromURLString(_ urlString: String) {
+        guard let token = extractToken(from: urlString) else {
+            errorMessage = "Не удалось найти access_token в URL."
+            return
+        }
+        saveToken(token)
+    }
+
     func logout() {
         accessToken = ""
         UserDefaults.standard.removeObject(forKey: tokenStorageKey)
@@ -95,11 +103,45 @@ final class VKAuthStore: ObservableObject {
             }
         }.resume()
     }
+
+    private func extractToken(from input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        // Supports both full OAuth callback URL and plain token text.
+        if !trimmed.contains("://") && !trimmed.contains("#") && !trimmed.contains("&") {
+            return trimmed
+        }
+
+        let fragmentString: String?
+        if let hashIndex = trimmed.firstIndex(of: "#") {
+            fragmentString = String(trimmed[trimmed.index(after: hashIndex)...])
+        } else {
+            fragmentString = URLComponents(string: trimmed)?.fragment
+        }
+
+        guard let fragment = fragmentString else {
+            return nil
+        }
+
+        for param in fragment.split(separator: "&") {
+            let pair = param.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 && pair[0] == "access_token" {
+                return pair[1]
+            }
+        }
+
+        return nil
+    }
 }
 
 struct ContentView: View {
     @StateObject private var authStore = VKAuthStore()
     @StateObject private var authSessionManager = VKAuthSessionManager()
+    @State private var isManualTokenURLInputVisible = false
+    @State private var manualTokenURL = ""
 
     var body: some View {
         NavigationView {
@@ -134,7 +176,7 @@ struct ContentView: View {
     }
 
     private var authView: some View {
-        VStack {
+        VStack(spacing: 18) {
             Spacer()
             Button("Авторизоваться в VK") {
                 authSessionManager.start { result in
@@ -152,6 +194,31 @@ struct ContentView: View {
             .background(Color.blue)
             .foregroundColor(.white)
             .clipShape(Capsule())
+
+            Button(isManualTokenURLInputVisible ? "Скрыть ввод URL с токеном" : "Ставить URL с токеном") {
+                withAnimation {
+                    isManualTokenURLInputVisible.toggle()
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+
+            if isManualTokenURLInputVisible {
+                VStack(spacing: 10) {
+                    TextField("Введите URL с токеном", text: $manualTokenURL)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .autocorrectionDisabled(true)
+                        .keyboardType(.URL)
+                        .textFieldStyle(.roundedBorder)
+                        .padding(.horizontal, 24)
+
+                    Button("Загрузить песни по URL") {
+                        authStore.saveTokenFromURLString(manualTokenURL)
+                    }
+                    .disabled(manualTokenURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
