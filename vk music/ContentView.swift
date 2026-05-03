@@ -200,15 +200,14 @@ struct ContentView: View {
                     isManualTokenURLInputVisible.toggle()
                 }
             }
-            .font(.subheadline.weight(.semibold))
+            .font(.system(size: 15, weight: .semibold))
 
             if isManualTokenURLInputVisible {
                 VStack(spacing: 10) {
                     TextField("Введите URL с токеном", text: $manualTokenURL)
-                        .textInputAutocapitalization(.never)
+                        .autocapitalization(.none)
                         .disableAutocorrection(true)
-                        .autocorrectionDisabled(true)
-                        .keyboardType(.URL)
+                        .keyboardType(.url)
                         .textFieldStyle(.roundedBorder)
                         .padding(.horizontal, 24)
 
@@ -217,7 +216,7 @@ struct ContentView: View {
                     }
                     .disabled(manualTokenURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AnyTransition.opacity.combined(with: .move(edge: .top)))
             }
             Spacer()
         }
