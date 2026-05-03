@@ -1,5 +1,5 @@
 import SwiftUI
-import WebKit
+import AuthenticationServices
 
 struct AudioTrack: Decodable, Identifiable {
     let id: Int
@@ -99,7 +99,7 @@ final class VKAuthStore: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var authStore = VKAuthStore()
-    @State private var isShowingWebView = false
+    @StateObject private var authSessionManager = VKAuthSessionManager()
 
     var body: some View {
         NavigationView {
@@ -131,32 +131,20 @@ struct ContentView: View {
                 authStore.fetchTracks()
             }
         }
-        .sheet(isPresented: $isShowingWebView) {
-            NavigationView {
-                VKOAuthWebView { token in
-                    isShowingWebView = false
-                    authStore.saveToken(token)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .navigationTitle("ВКонтакте")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Закрыть") {
-                            isShowingWebView = false
-                        }
-                    }
-                }
-            }
-            .navigationViewStyle(StackNavigationViewStyle())
-        }
     }
 
     private var authView: some View {
         VStack {
             Spacer()
             Button("Авторизоваться в VK") {
-                isShowingWebView = true
+                authSessionManager.start { result in
+                    switch result {
+                    case .success(let token):
+                        authStore.saveToken(token)
+                    case .failure(let error):
+                        authStore.errorMessage = error.localizedDescription
+                    }
+                }
             }
             .font(.headline)
             .padding(.horizontal, 20)
@@ -200,78 +188,100 @@ struct ContentView: View {
     }
 }
 
-struct VKOAuthWebView: UIViewRepresentable {
-    /// display=mobile лучше подходит для WebView; redirect_uri должен совпадать с настройками приложения VK.
-    private let authURLString = "https://oauth.vk.com/authorize?client_id=6463690&display=mobile&redirect_uri=https://oauth.vk.com/blank.html&scope=audio,offline&response_type=token&v=5.131"
+final class VKAuthSessionManager: NSObject, ObservableObject, ASWebAuthenticationPresentationContextProviding {
+    private let callbackScheme = "vkmusicauth"
+    private lazy var redirectURI = "\(callbackScheme)://oauth.vk.com/blank.html"
+    private var currentSession: ASWebAuthenticationSession?
 
-    let onTokenReceived: (String) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onTokenReceived: onTokenReceived)
-    }
-
-    func makeUIView(context: Context) -> UIView {
-        let container = UIView()
-        container.backgroundColor = .systemBackground
-
-        let config = WKWebViewConfiguration()
-        config.preferences.javaScriptCanOpenWindowsAutomatically = true
-        if #available(iOS 13.0, *) {
-            config.defaultWebpagePreferences.preferredContentMode = .mobile
+    func start(onResult: @escaping (Result<String, Error>) -> Void) {
+        guard let authURL = makeAuthURL() else {
+            onResult(.failure(VKAuthError.invalidAuthURL))
+            return
         }
 
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        webView.navigationDelegate = context.coordinator
-        webView.allowsBackForwardNavigationGestures = true
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+        let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: callbackScheme) { [weak self] callbackURL, error in
+            self?.currentSession = nil
 
-        container.addSubview(webView)
-        NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: container.topAnchor),
-            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
-
-        if let url = URL(string: authURLString) {
-            webView.load(URLRequest(url: url))
-        }
-
-        return container
-    }
-
-    func updateUIView(_ uiView: UIView, context: Context) {}
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        let onTokenReceived: (String) -> Void
-
-        init(onTokenReceived: @escaping (String) -> Void) {
-            self.onTokenReceived = onTokenReceived
-        }
-
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            if let url = navigationAction.request.url,
-               let fragment = url.fragment,
-               url.absoluteString.contains("oauth.vk.com/blank.html"),
-               let token = extractToken(from: fragment) {
-                onTokenReceived(token)
-                decisionHandler(.cancel)
+            if let error = error {
+                onResult(.failure(error))
                 return
             }
 
-            decisionHandler(.allow)
+            guard let callbackURL = callbackURL else {
+                onResult(.failure(VKAuthError.emptyCallback))
+                return
+            }
+
+            guard let token = self?.extractToken(from: callbackURL) else {
+                onResult(.failure(VKAuthError.tokenNotFound))
+                return
+            }
+
+            onResult(.success(token))
         }
 
-        private func extractToken(from fragment: String) -> String? {
-            let params = fragment.split(separator: "&")
-            for param in params {
-                let pair = param.split(separator: "=", maxSplits: 1).map(String.init)
-                if pair.count == 2 && pair[0] == "access_token" {
-                    return pair[1]
-                }
-            }
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = true
+        currentSession = session
+
+        if !session.start() {
+            onResult(.failure(VKAuthError.unableToStartSession))
+            currentSession = nil
+        }
+    }
+
+    private func makeAuthURL() -> URL? {
+        var components = URLComponents(string: "https://oauth.vk.com/authorize")
+        components?.queryItems = [
+            URLQueryItem(name: "client_id", value: "6463690"),
+            URLQueryItem(name: "display", value: "page"),
+            URLQueryItem(name: "redirect_uri", value: redirectURI),
+            URLQueryItem(name: "scope", value: "audio,offline"),
+            URLQueryItem(name: "response_type", value: "token"),
+            URLQueryItem(name: "v", value: "5.131"),
+        ]
+        return components?.url
+    }
+
+    private func extractToken(from callbackURL: URL) -> String? {
+        guard let fragment = callbackURL.fragment else {
             return nil
+        }
+
+        let params = fragment.split(separator: "&")
+        for param in params {
+            let pair = param.split(separator: "=", maxSplits: 1).map(String.init)
+            if pair.count == 2 && pair[0] == "access_token" {
+                return pair[1]
+            }
+        }
+        return nil
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow) ?? ASPresentationAnchor()
+    }
+}
+
+enum VKAuthError: LocalizedError {
+    case invalidAuthURL
+    case emptyCallback
+    case tokenNotFound
+    case unableToStartSession
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAuthURL:
+            return "Не удалось сформировать URL авторизации VK."
+        case .emptyCallback:
+            return "Не получен callback URL после авторизации."
+        case .tokenNotFound:
+            return "Токен не найден в callback URL."
+        case .unableToStartSession:
+            return "Не удалось запустить сессию авторизации."
         }
     }
 }
