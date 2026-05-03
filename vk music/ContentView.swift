@@ -200,15 +200,11 @@ struct ContentView: View {
                     isManualTokenURLInputVisible.toggle()
                 }
             }
-            .font(.system(size: 15, weight: .semibold))
+            .font(Font.system(size: 15))
 
             if isManualTokenURLInputVisible {
                 VStack(spacing: 10) {
                     TextField("Введите URL с токеном", text: $manualTokenURL)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        .keyboardType(.url)
-                        .textFieldStyle(.roundedBorder)
                         .padding(.horizontal, 24)
 
                     Button("Загрузить песни по URL") {
@@ -216,7 +212,6 @@ struct ContentView: View {
                     }
                     .disabled(manualTokenURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .transition(AnyTransition.opacity.combined(with: .move(edge: .top)))
             }
             Spacer()
         }
