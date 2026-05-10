@@ -1,11 +1,25 @@
 import SwiftUI
 import WebKit
+import AVFoundation
 
 struct AudioTrack: Decodable, Identifiable {
     let id: Int
+    let ownerID: Int
     let artist: String
     let title: String
     let duration: Int?
+    let url: String?
+    let accessKey: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case ownerID = "owner_id"
+        case artist
+        case title
+        case duration
+        case url
+        case accessKey = "access_key"
+    }
 }
 
 private struct VKAudioResponse: Decodable {
@@ -28,6 +42,7 @@ final class VKAuthStore: ObservableObject {
     @Published var tracks: [AudioTrack] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published var deletingTrackIDs: Set<Int> = []
 
     init() {
         accessToken = UserDefaults.standard.string(forKey: tokenStorageKey) ?? ""
@@ -104,6 +119,58 @@ final class VKAuthStore: ObservableObject {
         }.resume()
     }
 
+    func deleteTrack(_ track: AudioTrack) {
+        guard !accessToken.isEmpty else { return }
+        guard !deletingTrackIDs.contains(track.id) else { return }
+
+        deletingTrackIDs.insert(track.id)
+
+        var components = URLComponents(string: "https://api.vk.com/method/audio.delete")
+        components?.queryItems = [
+            URLQueryItem(name: "audio_id", value: String(track.id)),
+            URLQueryItem(name: "owner_id", value: String(track.ownerID)),
+            URLQueryItem(name: "access_key", value: track.accessKey),
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "v", value: "5.131")
+        ]
+
+        guard let url = components?.url else {
+            DispatchQueue.main.async {
+                self.deletingTrackIDs.remove(track.id)
+                self.errorMessage = "Не удалось удалить песню: некорректный URL."
+            }
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.deletingTrackIDs.remove(track.id)
+
+                if let error = error {
+                    self.errorMessage = "Не удалось удалить песню: \(error.localizedDescription)"
+                    return
+                }
+
+                guard let data = data else {
+                    self.errorMessage = "Не удалось удалить песню: пустой ответ."
+                    return
+                }
+
+                do {
+                    let response = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    if response?["error"] != nil {
+                        self.errorMessage = "VK отклонил удаление песни."
+                        return
+                    }
+                    self.tracks.removeAll { $0.id == track.id && $0.ownerID == track.ownerID }
+                } catch {
+                    self.errorMessage = "Не удалось удалить песню: \(error.localizedDescription)"
+                }
+            }
+        }.resume()
+    }
+
     private func extractToken(from input: String) -> String? {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -137,8 +204,175 @@ final class VKAuthStore: ObservableObject {
     }
 }
 
+final class AudioPlayerStore: ObservableObject {
+    @Published var selectedTrackID: Int?
+    @Published var isPlaying = false
+    @Published var currentTime: Double = 0
+    @Published var totalDuration: Double = 1
+    @Published var isDownloading = false
+    @Published var downloadedTrackIDs: Set<Int> = []
+    @Published var playerError: String?
+
+    private var player: AVPlayer?
+    private var timeObserver: Any?
+    private var selectedTrack: AudioTrack?
+    private var isSeeking = false
+    private var itemStatusObserver: NSKeyValueObservation?
+
+    init() {
+        setupAudioSession()
+    }
+    private func setupAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Ошибка настройки AVAudioSession: \(error)")
+        }
+    }
+
+    deinit {
+        if let observer = timeObserver {
+            player?.removeTimeObserver(observer)
+        }
+    }
+
+    func selectTrack(_ track: AudioTrack) {
+        guard let urlString = track.url, let url = URL(string: urlString) else {
+            playerError = "Для этого трека нет URL воспроизведения."
+            return
+        }
+
+        playerError = nil
+        selectedTrackID = track.id
+        selectedTrack = track
+        totalDuration = max(Double(track.duration ?? 1), 1)
+        currentTime = 0
+
+        if let observer = timeObserver {
+            player?.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+        itemStatusObserver = nil
+
+        let item = AVPlayerItem(url: url)
+        itemStatusObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if observedItem.status == .failed {
+                    self.playerError = observedItem.error?.localizedDescription ?? "Не удалось начать воспроизведение."
+                    self.isPlaying = false
+                }
+            }
+        }
+        player = AVPlayer(playerItem: item)
+        addTimeObserver()
+        play()
+    }
+
+    func play() {
+        player?.play()
+        isPlaying = true
+    }
+
+    func pause() {
+        player?.pause()
+        isPlaying = false
+    }
+
+    func togglePlayPause() {
+        isPlaying ? pause() : play()
+    }
+
+    func beginSeeking() {
+        isSeeking = true
+    }
+
+    func endSeeking() {
+        seek(to: currentTime)
+        isSeeking = false
+    }
+
+    func seek(to seconds: Double) {
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    func isTrackDownloaded(_ track: AudioTrack) -> Bool {
+        downloadedTrackIDs.contains(track.id) || FileManager.default.fileExists(atPath: cacheURL(for: track).path)
+    }
+
+    func downloadSelectedTrackToCache() {
+        guard let track = selectedTrack else { return }
+        guard let urlString = track.url, let remoteURL = URL(string: urlString) else {
+            playerError = "Невозможно скачать трек: отсутствует URL."
+            return
+        }
+
+        let destinationURL = cacheURL(for: track)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            downloadedTrackIDs.insert(track.id)
+            return
+        }
+
+        isDownloading = true
+        playerError = nil
+
+        URLSession.shared.downloadTask(with: remoteURL) { [weak self] tempURL, _, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isDownloading = false
+
+                if let error = error {
+                    self.playerError = "Ошибка скачивания: \(error.localizedDescription)"
+                    return
+                }
+
+                guard let tempURL = tempURL else {
+                    self.playerError = "Ошибка скачивания: временный файл не найден."
+                    return
+                }
+
+                do {
+                    let fm = FileManager.default
+                    let cacheDirectory = self.trackCacheDirectory()
+                    if !fm.fileExists(atPath: cacheDirectory.path) {
+                        try fm.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+                    }
+                    try fm.moveItem(at: tempURL, to: destinationURL)
+                    self.downloadedTrackIDs.insert(track.id)
+                } catch {
+                    self.playerError = "Ошибка сохранения в кэш: \(error.localizedDescription)"
+                }
+            }
+        }.resume()
+    }
+
+    private func addTimeObserver() {
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self else { return }
+            if !self.isSeeking {
+                self.currentTime = time.seconds.isFinite ? time.seconds : 0
+            }
+            if let itemDuration = self.player?.currentItem?.duration.seconds, itemDuration.isFinite, itemDuration > 0 {
+                self.totalDuration = itemDuration
+            }
+        }
+    }
+
+    private func trackCacheDirectory() -> URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("track-cache")
+    }
+
+    private func cacheURL(for track: AudioTrack) -> URL {
+        trackCacheDirectory().appendingPathComponent("\(track.ownerID)_\(track.id).mp3")
+    }
+}
+
 struct ContentView: View {
     @StateObject private var authStore = VKAuthStore()
+    @StateObject private var playerStore = AudioPlayerStore()
     @State private var isAuthWebViewPresented = false
     @State private var isManualTokenURLInputVisible = false
     @State private var manualTokenURL = ""
@@ -224,7 +458,45 @@ struct ContentView: View {
     }
 
     private var songsView: some View {
-        Group {
+        VStack(spacing: 0) {
+            if playerStore.selectedTrackID != nil {
+                VStack(spacing: 12) {
+                    Slider(
+                        value: $playerStore.currentTime,
+                        in: 0...max(playerStore.totalDuration, 1),
+                        onEditingChanged: { editing in
+                            if editing {
+                                playerStore.beginSeeking()
+                            } else {
+                                playerStore.endSeeking()
+                            }
+                        }
+                    )
+
+                    HStack(spacing: 16) {
+                        Button(action: {
+                            playerStore.togglePlayPause()
+                        }) {
+                            Image(systemName: playerStore.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.title2)
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button(action: {
+                            playerStore.downloadSelectedTrackToCache()
+                        }) {
+                            if playerStore.isDownloading {
+                                ProgressView()
+                            } else {
+                                Text("Скачать в кэш")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding()
+            }
+
             if authStore.isLoading {
                 ProgressView("Загружаем песни...")
             } else if let error = authStore.errorMessage {
@@ -240,15 +512,45 @@ struct ContentView: View {
                 Text("Список песен пуст.")
             } else {
                 List(authStore.tracks) { track in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(track.title)
-                            .font(.headline)
-                        Text(track.artist)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(track.title)
+                                .font(.headline)
+                            Text(track.artist)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if playerStore.isTrackDownloaded(track) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .foregroundColor(.green)
+                        }
+                        Button(role: .destructive) {
+                            authStore.deleteTrack(track)
+                        } label: {
+                            if authStore.deletingTrackIDs.contains(track.id) {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                            } else {
+                                Image(systemName: "trash")
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        playerStore.selectTrack(track)
                     }
                 }
                 .listStyle(InsetGroupedListStyle())
+            }
+
+            if let playerError = playerStore.playerError {
+                Text(playerError)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
             }
         }
     }
