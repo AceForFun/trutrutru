@@ -3,7 +3,7 @@ import UIKit
 import WebKit
 import AVFoundation
 
-struct AudioTrack: Decodable, Identifiable, Hashable {
+struct AudioTrack: Codable, Identifiable, Hashable {
     let id: Int
     let ownerID: Int
     let artist: String
@@ -52,6 +52,7 @@ enum AppScreen {
 
 final class VKAuthStore: ObservableObject {
     private let tokenStorageKey = "vk_access_token"
+    private let tracksStorageKey = "vk_tracks_cache"
 
     @Published var accessToken: String = ""
     @Published var tracks: [AudioTrack] = []
@@ -61,6 +62,7 @@ final class VKAuthStore: ObservableObject {
 
     init() {
         accessToken = UserDefaults.standard.string(forKey: tokenStorageKey) ?? ""
+        tracks = loadCachedTracks()
     }
 
     var screen: AppScreen {
@@ -77,6 +79,7 @@ final class VKAuthStore: ObservableObject {
     func logout() {
         accessToken = ""
         UserDefaults.standard.removeObject(forKey: tokenStorageKey)
+        UserDefaults.standard.removeObject(forKey: tracksStorageKey)
         tracks = []
         errorMessage = nil
     }
@@ -103,24 +106,22 @@ final class VKAuthStore: ObservableObject {
                 self.isLoading = false
 
                 if let error = error {
-                    self.tracks = []
-                    self.errorMessage = "Не удалось загрузить список песен: \(error.localizedDescription)"
+                    self.errorMessage = "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки."
                     return
                 }
 
                 guard let data = data else {
-                    self.tracks = []
-                    self.errorMessage = "Не удалось загрузить список песен: пустой ответ."
+                    self.errorMessage = "Не удалось обновить список песен: пустой ответ. Показаны сохранённые треки."
                     return
                 }
 
                 do {
                     let decoded = try JSONDecoder().decode(VKAudioResponse.self, from: data)
                     self.tracks = decoded.response.items
+                    self.cacheTracks(decoded.response.items)
                     self.errorMessage = nil
                 } catch {
-                    self.tracks = []
-                    self.errorMessage = "Не удалось загрузить список песен: \(error.localizedDescription)"
+                    self.errorMessage = "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки."
                 }
             }
         }.resume()
@@ -171,6 +172,7 @@ final class VKAuthStore: ObservableObject {
                         return
                     }
                     self.tracks.removeAll { $0.id == track.id && $0.ownerID == track.ownerID }
+                    self.cacheTracks(self.tracks)
                 } catch {
                     self.errorMessage = "Не удалось удалить песню: \(error.localizedDescription)"
                 }
@@ -277,6 +279,18 @@ final class VKAuthStore: ObservableObject {
                 }
             }
         }.resume()
+    }
+
+    private func loadCachedTracks() -> [AudioTrack] {
+        guard let data = UserDefaults.standard.data(forKey: tracksStorageKey) else {
+            return []
+        }
+        return (try? JSONDecoder().decode([AudioTrack].self, from: data)) ?? []
+    }
+
+    private func cacheTracks(_ tracks: [AudioTrack]) {
+        guard let data = try? JSONEncoder().encode(tracks) else { return }
+        UserDefaults.standard.set(data, forKey: tracksStorageKey)
     }
 }
 
@@ -427,6 +441,10 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     private func makePlayerItem(for track: AudioTrack) -> AVPlayerItem? {
+        let localURL = cacheURL(for: track)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            return AVPlayerItem(url: localURL)
+        }
         guard let urlString = track.url, let url = URL(string: urlString) else { return nil }
         return AVPlayerItem(url: url)
     }

@@ -7,17 +7,17 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		8A0FB13B2FB1150800A515B0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8A0FB13A2FB1150800A515B0 /* Assets.xcassets */; };
 		8A8646602FA54A9400AD5119 /* vk_musicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A86465F2FA54A9400AD5119 /* vk_musicApp.swift */; };
 		8A8646622FA54A9400AD5119 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8646612FA54A9400AD5119 /* ContentView.swift */; };
-		8A8646642FA54A9500AD5119 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8A8646632FA54A9500AD5119 /* Assets.xcassets */; };
 		8A8646672FA54A9500AD5119 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8A8646662FA54A9500AD5119 /* Preview Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		8A0FB13A2FB1150800A515B0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8A86465C2FA54A9400AD5119 /* vk music.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "vk music.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		8A86465F2FA54A9400AD5119 /* vk_musicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = vk_musicApp.swift; sourceTree = "<group>"; };
 		8A8646612FA54A9400AD5119 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		8A8646632FA54A9500AD5119 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8A8646662FA54A9500AD5119 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		8A8646682FA54A9500AD5119 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -52,9 +52,9 @@
 		8A86465E2FA54A9400AD5119 /* vk music */ = {
 			isa = PBXGroup;
 			children = (
+				8A0FB13A2FB1150800A515B0 /* Assets.xcassets */,
 				8A86465F2FA54A9400AD5119 /* vk_musicApp.swift */,
 				8A8646612FA54A9400AD5119 /* ContentView.swift */,
-				8A8646632FA54A9500AD5119 /* Assets.xcassets */,
 				8A8646682FA54A9500AD5119 /* Info.plist */,
 				8A8646652FA54A9500AD5119 /* Preview Content */,
 			);
@@ -126,8 +126,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8A0FB13B2FB1150800A515B0 /* Assets.xcassets in Resources */,
 				8A8646672FA54A9500AD5119 /* Preview Assets.xcassets in Resources */,
-				8A8646642FA54A9500AD5119 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
