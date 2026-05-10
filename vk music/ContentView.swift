@@ -298,7 +298,15 @@ private func trackLibrarySimilarityKey(_ track: AudioTrack) -> String {
     return "\(a)|\(t)|\(track.duration ?? 0)"
 }
 
+/// Где показывать блок с слайдером; воспроизведение при этом не останавливается.
+enum NowPlayingChrome: Equatable {
+    case hidden
+    case mySongs
+    case search
+}
+
 final class AudioPlayerStore: ObservableObject {
+    @Published var nowPlayingChrome: NowPlayingChrome = .hidden
     @Published var selectedTrackID: Int?
     @Published var nowPlayingTrack: AudioTrack?
     @Published var isPlaying = false
@@ -363,9 +371,16 @@ final class AudioPlayerStore: ObservableObject {
         playbackQueue = []
         currentQueueIndex = 0
         repeatOne = false
+        nowPlayingChrome = .hidden
     }
 
-    func selectTrack(_ track: AudioTrack, playlist: [AudioTrack]) {
+    /// Скрыть слайдер (например при открытии поиска или возврате с него); плеер не трогаем.
+    func hidePlaybackChrome() {
+        nowPlayingChrome = .hidden
+    }
+
+    func selectTrack(_ track: AudioTrack, playlist: [AudioTrack], chrome: NowPlayingChrome) {
+        nowPlayingChrome = chrome
         guard let idx = playlist.firstIndex(where: { $0.id == track.id && $0.ownerID == track.ownerID }) else {
             playbackQueue = [track]
             currentQueueIndex = 0
@@ -554,6 +569,7 @@ private func formatPlaybackSeconds(_ seconds: Double) -> String {
 
 private struct NowPlayingControlsView: View {
     @ObservedObject var playerStore: AudioPlayerStore
+    var showDownloadToCache: Bool = true
 
     var body: some View {
         if playerStore.selectedTrackID != nil {
@@ -601,16 +617,18 @@ private struct NowPlayingControlsView: View {
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Button(action: {
-                        playerStore.downloadSelectedTrackToCache()
-                    }) {
-                        if playerStore.isDownloading {
-                            ProgressView()
-                        } else {
-                            Text("Скачать в кэш")
+                    if showDownloadToCache {
+                        Button(action: {
+                            playerStore.downloadSelectedTrackToCache()
+                        }) {
+                            if playerStore.isDownloading {
+                                ProgressView()
+                            } else {
+                                Text("Скачать в кэш")
+                            }
                         }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
                 }
             }
             .padding()
@@ -634,7 +652,9 @@ private struct SearchTracksView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            NowPlayingControlsView(playerStore: playerStore)
+            if playerStore.nowPlayingChrome == .search {
+                NowPlayingControlsView(playerStore: playerStore, showDownloadToCache: false)
+            }
 
             Group {
                 if isSearching {
@@ -697,6 +717,12 @@ private struct SearchTracksView: View {
             .padding(.vertical, 12)
             .background(.thinMaterial)
         }
+        .onAppear {
+            playerStore.hidePlaybackChrome()
+        }
+        .onDisappear {
+            playerStore.hidePlaybackChrome()
+        }
     }
 
     private var trimmedQuery: String {
@@ -749,7 +775,7 @@ private struct SearchTracksView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            playerStore.selectTrack(track, playlist: results)
+            playerStore.selectTrack(track, playlist: results, chrome: .search)
         }
     }
 
@@ -856,7 +882,9 @@ struct ContentView: View {
 
     private var songsView: some View {
         VStack(spacing: 0) {
-            NowPlayingControlsView(playerStore: playerStore)
+            if playerStore.nowPlayingChrome == .mySongs {
+                NowPlayingControlsView(playerStore: playerStore)
+            }
 
             if authStore.isLoading {
                 ProgressView("Загружаем песни...")
@@ -903,7 +931,7 @@ struct ContentView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        playerStore.selectTrack(track, playlist: authStore.tracks)
+                        playerStore.selectTrack(track, playlist: authStore.tracks, chrome: .mySongs)
                     }
                 }
                 .listStyle(InsetGroupedListStyle())
