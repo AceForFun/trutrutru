@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 import AVFoundation
 
@@ -317,18 +318,26 @@ final class AudioPlayerStore: ObservableObject {
     @Published var playerError: String?
     @Published var repeatOne = false
 
-    private var player: AVPlayer?
+    /// Очередь даёт переход на следующий трек внутри AVFoundation (в т.ч. в фоне), без ожидания main run loop.
+    private var queuePlayer: AVQueuePlayer?
     private var timeObserver: Any?
     private var selectedTrack: AudioTrack?
     private var isSeeking = false
-    private var itemStatusObserver: NSKeyValueObservation?
     private var playbackQueue: [AudioTrack] = []
     private var currentQueueIndex: Int = 0
-    private var endPlaybackObserver: NSObjectProtocol?
+
+    private var itemTrackIndex: [ObjectIdentifier: Int] = [:]
+    private var itemEndObservers: [NSObjectProtocol] = []
+    private var itemStatusObservations: [NSKeyValueObservation] = []
+    private var currentItemObserver: NSKeyValueObservation?
+
+    /// Для повтора одного трека и финала плейлиста — обновление UI/seek на main после остановки.
+    private var advanceTrackBackgroundTask = UIBackgroundTaskIdentifier.invalid
 
     init() {
         setupAudioSession()
     }
+
     private func setupAudioSession() {
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
@@ -339,28 +348,50 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     deinit {
-        removeEndObserver()
-        if let observer = timeObserver {
-            player?.removeTimeObserver(observer)
+        releasePlayerResources()
+    }
+
+    private func beginAdvanceTrackBackgroundTask() {
+        endAdvanceTrackBackgroundTask()
+        advanceTrackBackgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+            self?.endAdvanceTrackBackgroundTask()
         }
     }
 
-    private func removeEndObserver() {
-        if let endPlaybackObserver {
-            NotificationCenter.default.removeObserver(endPlaybackObserver)
+    private func endAdvanceTrackBackgroundTask() {
+        guard advanceTrackBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(advanceTrackBackgroundTask)
+        advanceTrackBackgroundTask = .invalid
+    }
+
+    private func removeAllItemEndObservers() {
+        for observer in itemEndObservers {
+            NotificationCenter.default.removeObserver(observer)
         }
-        endPlaybackObserver = nil
+        itemEndObservers.removeAll()
+    }
+
+    private func clearItemStatusObservations() {
+        itemStatusObservations.removeAll()
+    }
+
+    private func releasePlayerResources() {
+        currentItemObserver?.invalidate()
+        currentItemObserver = nil
+        removeAllItemEndObservers()
+        clearItemStatusObservations()
+        if let observer = timeObserver {
+            queuePlayer?.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+        endAdvanceTrackBackgroundTask()
+        queuePlayer?.pause()
+        queuePlayer = nil
+        itemTrackIndex.removeAll()
     }
 
     func resetForLogout() {
-        pause()
-        if let observer = timeObserver {
-            player?.removeTimeObserver(observer)
-            timeObserver = nil
-        }
-        removeEndObserver()
-        itemStatusObserver = nil
-        player = nil
+        releasePlayerResources()
         selectedTrack = nil
         nowPlayingTrack = nil
         selectedTrackID = nil
@@ -383,42 +414,25 @@ final class AudioPlayerStore: ObservableObject {
         nowPlayingChrome = chrome
         guard let idx = playlist.firstIndex(where: { $0.id == track.id && $0.ownerID == track.ownerID }) else {
             playbackQueue = [track]
-            currentQueueIndex = 0
-            loadCurrentTrack(track)
+            loadAndPlayTrack(at: 0)
             return
         }
         playbackQueue = playlist
-        currentQueueIndex = idx
         loadAndPlayTrack(at: idx)
     }
 
     private func loadAndPlayTrack(at index: Int) {
         guard index >= 0 && index < playbackQueue.count else { return }
-        loadCurrentTrack(playbackQueue[index])
+        loadCurrentTrack(at: index)
     }
 
-    private func loadCurrentTrack(_ track: AudioTrack) {
-        guard let urlString = track.url, let url = URL(string: urlString) else {
-            playerError = "Для этого трека нет URL воспроизведения."
-            return
-        }
+    private func makePlayerItem(for track: AudioTrack) -> AVPlayerItem? {
+        guard let urlString = track.url, let url = URL(string: urlString) else { return nil }
+        return AVPlayerItem(url: url)
+    }
 
-        playerError = nil
-        selectedTrackID = track.id
-        nowPlayingTrack = track
-        selectedTrack = track
-        totalDuration = max(Double(track.duration ?? 1), 1)
-        currentTime = 0
-
-        if let observer = timeObserver {
-            player?.removeTimeObserver(observer)
-            timeObserver = nil
-        }
-        itemStatusObserver = nil
-        removeEndObserver()
-
-        let item = AVPlayerItem(url: url)
-        itemStatusObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
+    private func observeItemFailure(_ item: AVPlayerItem) {
+        let observation = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if observedItem.status == .failed {
@@ -427,45 +441,168 @@ final class AudioPlayerStore: ObservableObject {
                 }
             }
         }
-        player = AVPlayer(playerItem: item)
-        addTimeObserver()
-
-        endPlaybackObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handlePlaybackReachedEnd()
-        }
-
-        play()
+        itemStatusObservations.append(observation)
     }
 
-    private func handlePlaybackReachedEnd() {
+    private func attachPlayToEndObserver(_ item: AVPlayerItem, trackIndex: Int) {
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleItemPlayedToEnd(trackIndex: trackIndex)
+        }
+        itemEndObservers.append(observer)
+    }
+
+    private func handleItemPlayedToEnd(trackIndex: Int) {
         if repeatOne {
-            player?.seek(to: .zero)
-            play()
+            beginAdvanceTrackBackgroundTask()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard let qp = self.queuePlayer else {
+                    self.endAdvanceTrackBackgroundTask()
+                    return
+                }
+                qp.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                    DispatchQueue.main.async { [weak self] in
+                        defer { self?.endAdvanceTrackBackgroundTask() }
+                        guard let self, finished else { return }
+                        self.queuePlayer?.play()
+                        self.isPlaying = true
+                    }
+                }
+            }
             return
         }
-        if currentQueueIndex + 1 < playbackQueue.count {
-            currentQueueIndex += 1
-            loadAndPlayTrack(at: currentQueueIndex)
-        } else {
-            pause()
-            if let dur = player?.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
-                currentTime = dur
-                totalDuration = dur
+        guard trackIndex == playbackQueue.count - 1 else { return }
+        beginAdvanceTrackBackgroundTask()
+        DispatchQueue.main.async { [weak self] in
+            defer { self?.endAdvanceTrackBackgroundTask() }
+            guard let self else { return }
+            self.pause()
+            if let dur = self.queuePlayer?.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
+                self.currentTime = dur
+                self.totalDuration = dur
             }
         }
     }
 
+    private func observeCurrentItem(on player: AVQueuePlayer) {
+        currentItemObserver?.invalidate()
+        currentItemObserver = player.observe(\.currentItem, options: [.new, .initial]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.syncPublishedStateToCurrentItem()
+            }
+        }
+    }
+
+    private func syncPublishedStateToCurrentItem() {
+        guard let item = queuePlayer?.currentItem,
+              let idx = itemTrackIndex[ObjectIdentifier(item)] else { return }
+        let trackChanged = currentQueueIndex != idx
+        currentQueueIndex = idx
+        let track = playbackQueue[idx]
+        selectedTrackID = track.id
+        nowPlayingTrack = track
+        selectedTrack = track
+        totalDuration = max(Double(track.duration ?? 1), 1)
+        if trackChanged {
+            currentTime = 0
+        }
+        topUpForwardBuffer()
+    }
+
+    /// Держим в очереди текущий и следующий трек (следующий стартует без участия main).
+    private func topUpForwardBuffer() {
+        guard let qp = queuePlayer, !repeatOne else { return }
+        while qp.items().count < 2 {
+            guard let lastItem = qp.items().last,
+                  let lastIdx = itemTrackIndex[ObjectIdentifier(lastItem)] else { return }
+            let nextIdx = lastIdx + 1
+            guard nextIdx < playbackQueue.count else { return }
+            guard let nextItem = makePlayerItem(for: playbackQueue[nextIdx]) else { return }
+            observeItemFailure(nextItem)
+            itemTrackIndex[ObjectIdentifier(nextItem)] = nextIdx
+            attachPlayToEndObserver(nextItem, trackIndex: nextIdx)
+            qp.insert(nextItem, after: lastItem)
+        }
+    }
+
+    private func loadCurrentTrack(at index: Int) {
+        guard index >= 0 && index < playbackQueue.count else { return }
+        let track = playbackQueue[index]
+        guard makePlayerItem(for: track) != nil else {
+            playerError = "Для этого трека нет URL воспроизведения."
+            return
+        }
+
+        playerError = nil
+        releasePlayerResources()
+
+        var items: [AVPlayerItem] = []
+        guard let firstItem = makePlayerItem(for: track) else {
+            playerError = "Для этого трека нет URL воспроизведения."
+            return
+        }
+        observeItemFailure(firstItem)
+        itemTrackIndex[ObjectIdentifier(firstItem)] = index
+        attachPlayToEndObserver(firstItem, trackIndex: index)
+        items.append(firstItem)
+
+        if !repeatOne, index + 1 < playbackQueue.count, let secondItem = makePlayerItem(for: playbackQueue[index + 1]) {
+            let nextIndex = index + 1
+            observeItemFailure(secondItem)
+            itemTrackIndex[ObjectIdentifier(secondItem)] = nextIndex
+            attachPlayToEndObserver(secondItem, trackIndex: nextIndex)
+            items.append(secondItem)
+        }
+
+        let qp = AVQueuePlayer(items: items)
+        queuePlayer = qp
+        observeCurrentItem(on: qp)
+        addTimeObserver()
+
+        currentQueueIndex = index
+        selectedTrackID = track.id
+        nowPlayingTrack = track
+        selectedTrack = track
+        totalDuration = max(Double(track.duration ?? 1), 1)
+        currentTime = 0
+
+        topUpForwardBuffer()
+        play()
+    }
+
+    /// Включение «повтор одного» убирает предзагруженный следующий трек, иначе очередь переключилась бы на него раньше обработчика повтора.
+    func toggleRepeatOne() {
+        repeatOne.toggle()
+        if repeatOne {
+            trimQueuedItemsAfterCurrent()
+        } else {
+            topUpForwardBuffer()
+        }
+    }
+
+    private func trimQueuedItemsAfterCurrent() {
+        guard let qp = queuePlayer, let currentItem = qp.currentItem else { return }
+        let toRemove = qp.items().filter { $0 !== currentItem }
+        removeAllItemEndObservers()
+        for item in toRemove {
+            qp.remove(item)
+            itemTrackIndex.removeValue(forKey: ObjectIdentifier(item))
+        }
+        guard let idx = itemTrackIndex[ObjectIdentifier(currentItem)] else { return }
+        attachPlayToEndObserver(currentItem, trackIndex: idx)
+    }
+
     func play() {
-        player?.play()
+        queuePlayer?.play()
         isPlaying = true
     }
 
     func pause() {
-        player?.pause()
+        queuePlayer?.pause()
         isPlaying = false
     }
 
@@ -484,7 +621,7 @@ final class AudioPlayerStore: ObservableObject {
 
     func seek(to seconds: Double) {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        player?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        queuePlayer?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
     func isTrackDownloaded(_ track: AudioTrack) -> Bool {
@@ -539,12 +676,12 @@ final class AudioPlayerStore: ObservableObject {
 
     private func addTimeObserver() {
         let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
-        timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+        timeObserver = queuePlayer?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self = self else { return }
             if !self.isSeeking {
                 self.currentTime = time.seconds.isFinite ? time.seconds : 0
             }
-            if let itemDuration = self.player?.currentItem?.duration.seconds, itemDuration.isFinite, itemDuration > 0 {
+            if let itemDuration = self.queuePlayer?.currentItem?.duration.seconds, itemDuration.isFinite, itemDuration > 0 {
                 self.totalDuration = itemDuration
             }
         }
@@ -574,6 +711,20 @@ private struct NowPlayingControlsView: View {
     var body: some View {
         if playerStore.selectedTrackID != nil {
             VStack(spacing: 10) {
+                if let track = playerStore.nowPlayingTrack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(track.title)
+                            .font(.headline)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        Text(track.artist)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 HStack(spacing: 12) {
                     Slider(
                         value: $playerStore.currentTime,
@@ -588,7 +739,7 @@ private struct NowPlayingControlsView: View {
                     )
 
                     Button {
-                        playerStore.repeatOne.toggle()
+                        playerStore.toggleRepeatOne()
                     } label: {
                         Image(systemName: "repeat.1")
                             .font(.title3)
@@ -813,9 +964,12 @@ private struct SearchTracksView: View {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+
     @StateObject private var authStore = VKAuthStore()
     @StateObject private var playerStore = AudioPlayerStore()
     @State private var isAuthWebViewPresented = false
+    @State private var isNowPlayingControlsHidden = false
 
     var body: some View {
         NavigationView {
@@ -825,8 +979,20 @@ struct ContentView: View {
                     .navigationTitle("Авторизация")
             case .songs:
                 songsView
-                    .navigationTitle("Мои песни")
+                    .navigationTitle("Музыка VK")
                     .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            Button {
+                                isNowPlayingControlsHidden.toggle()
+                            } label: {
+                                Image(systemName: isNowPlayingControlsHidden ? "eye" : "eye.slash")
+                            }
+                            .accessibilityLabel(
+                                isNowPlayingControlsHidden
+                                    ? "Показать панель плеера"
+                                    : "Скрыть панель плеера"
+                            )
+                        }
                         ToolbarItem(placement: .navigationBarLeading) {
                             NavigationLink(destination: SearchTracksView(authStore: authStore, playerStore: playerStore)) {
                                 Image(systemName: "magnifyingglass")
@@ -882,7 +1048,7 @@ struct ContentView: View {
 
     private var songsView: some View {
         VStack(spacing: 0) {
-            if playerStore.nowPlayingChrome == .mySongs {
+            if playerStore.nowPlayingChrome == .mySongs && !isNowPlayingControlsHidden {
                 NowPlayingControlsView(playerStore: playerStore)
             }
 
@@ -900,41 +1066,55 @@ struct ContentView: View {
             } else if authStore.tracks.isEmpty {
                 Text("Список песен пуст.")
             } else {
-                List(authStore.tracks) { track in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(track.title)
-                                .font(.headline)
-                            Text(track.artist)
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer(minLength: 8)
-                        Text(formatTrackDuration(track.duration))
-                            .font(.caption.monospacedDigit())
-                            .foregroundColor(.secondary)
-                        if playerStore.isTrackDownloaded(track) {
-                            Image(systemName: "arrow.down.circle.fill")
-                                .foregroundColor(.green)
-                        }
-                        Button(role: .destructive) {
-                            authStore.deleteTrack(track)
-                        } label: {
-                            if authStore.deletingTrackIDs.contains(track.id) {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                            } else {
-                                Image(systemName: "trash")
+                ScrollViewReader { proxy in
+                    List(authStore.tracks) { track in
+                        let playing = isNowPlayingTrack(track)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(track.title)
+                                    .font(.headline)
+                                Text(track.artist)
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
                             }
+                            Spacer(minLength: 8)
+                            Text(formatTrackDuration(track.duration))
+                                .font(.caption.monospacedDigit())
+                                .foregroundColor(.secondary)
+                            if playerStore.isTrackDownloaded(track) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .foregroundColor(.green)
+                            }
+                            Button(role: .destructive) {
+                                authStore.deleteTrack(track)
+                            } label: {
+                                if authStore.deletingTrackIDs.contains(track.id) {
+                                    ProgressView()
+                                        .progressViewStyle(.circular)
+                                } else {
+                                    Image(systemName: "trash")
+                                }
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            playerStore.selectTrack(track, playlist: authStore.tracks, chrome: .mySongs)
+                        }
+                        .listRowBackground(
+                            playing
+                                ? Color.accentColor.opacity(0.12)
+                                : nil
+                        )
+                        .id(mySongsRowId(track))
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        playerStore.selectTrack(track, playlist: authStore.tracks, chrome: .mySongs)
+                    .listStyle(InsetGroupedListStyle())
+                    .onChange(of: scenePhase) { phase in
+                        if phase == .active {
+                            scrollNowPlayingRowIntoView(using: proxy)
+                        }
                     }
                 }
-                .listStyle(InsetGroupedListStyle())
             }
 
             if let playerError = playerStore.playerError {
@@ -943,6 +1123,28 @@ struct ContentView: View {
                     .foregroundColor(.red)
                     .padding(.horizontal)
                     .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private func mySongsRowId(_ track: AudioTrack) -> String {
+        "my_songs_\(track.ownerID)_\(track.id)"
+    }
+
+    private func isNowPlayingTrack(_ track: AudioTrack) -> Bool {
+        guard let np = playerStore.nowPlayingTrack else { return false }
+        return np.id == track.id && np.ownerID == track.ownerID
+    }
+
+    private func scrollNowPlayingRowIntoView(using proxy: ScrollViewProxy) {
+        guard let np = playerStore.nowPlayingTrack else { return }
+        guard authStore.tracks.contains(where: { $0.id == np.id && $0.ownerID == np.ownerID }) else {
+            return
+        }
+        let targetId = mySongsRowId(np)
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(targetId, anchor: .center)
             }
         }
     }
