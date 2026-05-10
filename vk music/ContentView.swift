@@ -2,7 +2,7 @@ import SwiftUI
 import WebKit
 import AVFoundation
 
-struct AudioTrack: Decodable, Identifiable {
+struct AudioTrack: Decodable, Identifiable, Hashable {
     let id: Int
     let ownerID: Int
     let artist: String
@@ -28,6 +28,20 @@ private struct VKAudioResponse: Decodable {
 
 private struct VKAudioItems: Decodable {
     let items: [AudioTrack]
+}
+
+private struct VKAudioSearchResponse: Decodable {
+    let response: VKAudioSearchItems
+}
+
+private struct VKAudioSearchItems: Decodable {
+    let count: Int?
+    let items: [AudioTrack]
+}
+
+struct VKRequestError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 enum AppScreen {
@@ -57,14 +71,6 @@ final class VKAuthStore: ObservableObject {
         UserDefaults.standard.set(token, forKey: tokenStorageKey)
         errorMessage = nil
         fetchTracks()
-    }
-
-    func saveTokenFromURLString(_ urlString: String) {
-        guard let token = extractToken(from: urlString) else {
-            errorMessage = "Не удалось найти access_token в URL."
-            return
-        }
-        saveToken(token)
     }
 
     func logout() {
@@ -171,53 +177,146 @@ final class VKAuthStore: ObservableObject {
         }.resume()
     }
 
-    private func extractToken(from input: String) -> String? {
-        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    func searchTracks(query: String, completion: @escaping (Result<[AudioTrack], VKRequestError>) -> Void) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return nil
+            completion(.success([]))
+            return
+        }
+        guard !accessToken.isEmpty else {
+            completion(.failure(VKRequestError(message: "Нет токена доступа.")))
+            return
         }
 
-        // Supports both full OAuth callback URL and plain token text.
-        if !trimmed.contains("://") && !trimmed.contains("#") && !trimmed.contains("&") {
-            return trimmed
+        var components = URLComponents(string: "https://api.vk.com/method/audio.search")
+        components?.queryItems = [
+            URLQueryItem(name: "q", value: trimmed),
+            URLQueryItem(name: "count", value: "50"),
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "v", value: "5.131")
+        ]
+
+        guard let url = components?.url else {
+            completion(.failure(VKRequestError(message: "Некорректный запрос поиска.")))
+            return
         }
 
-        let fragmentString: String?
-        if let hashIndex = trimmed.firstIndex(of: "#") {
-            fragmentString = String(trimmed[trimmed.index(after: hashIndex)...])
-        } else {
-            fragmentString = URLComponents(string: trimmed)?.fragment
-        }
+        URLSession.shared.dataTask(with: url) { data, _, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    completion(.failure(VKRequestError(message: error.localizedDescription)))
+                    return
+                }
+                guard let data = data else {
+                    completion(.failure(VKRequestError(message: "Пустой ответ.")))
+                    return
+                }
 
-        guard let fragment = fragmentString else {
-            return nil
-        }
+                do {
+                    if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let vkError = obj["error"] as? [String: Any],
+                       let msg = vkError["error_msg"] as? String {
+                        completion(.failure(VKRequestError(message: msg)))
+                        return
+                    }
 
-        for param in fragment.split(separator: "&") {
-            let pair = param.split(separator: "=", maxSplits: 1).map(String.init)
-            if pair.count == 2 && pair[0] == "access_token" {
-                return pair[1]
+                    let decoded = try JSONDecoder().decode(VKAudioSearchResponse.self, from: data)
+                    completion(.success(decoded.response.items))
+                } catch {
+                    completion(.failure(VKRequestError(message: error.localizedDescription)))
+                }
             }
+        }.resume()
+    }
+
+    func addTrackToMyAudio(_ track: AudioTrack, completion: @escaping (Result<Void, VKRequestError>) -> Void) {
+        guard !accessToken.isEmpty else {
+            completion(.failure(VKRequestError(message: "Нет токена доступа.")))
+            return
         }
 
-        return nil
+        var components = URLComponents(string: "https://api.vk.com/method/audio.add")
+        var queryItems = [
+            URLQueryItem(name: "audio_id", value: String(track.id)),
+            URLQueryItem(name: "owner_id", value: String(track.ownerID)),
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "v", value: "5.131")
+        ]
+        if let accessKey = track.accessKey, !accessKey.isEmpty {
+            queryItems.insert(URLQueryItem(name: "access_key", value: accessKey), at: 2)
+        }
+        components?.queryItems = queryItems
+
+        guard let url = components?.url else {
+            completion(.failure(VKRequestError(message: "Некорректный URL.")))
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { data, _, error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    completion(.failure(VKRequestError(message: error.localizedDescription)))
+                    return
+                }
+                guard let data = data else {
+                    completion(.failure(VKRequestError(message: "Пустой ответ.")))
+                    return
+                }
+
+                do {
+                    if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let vkError = obj["error"] as? [String: Any],
+                       let msg = vkError["error_msg"] as? String {
+                        completion(.failure(VKRequestError(message: msg)))
+                        return
+                    }
+                    completion(.success(()))
+                } catch {
+                    completion(.failure(VKRequestError(message: error.localizedDescription)))
+                }
+            }
+        }.resume()
     }
+}
+
+private func formatTrackDuration(_ seconds: Int?) -> String {
+    let s = max(0, seconds ?? 0)
+    let m = s / 60
+    let sec = s % 60
+    return String(format: "%02d:%02d", m, sec)
+}
+
+private func trackPlaylistKey(_ track: AudioTrack) -> String {
+    "\(track.ownerID)_\(track.id)"
+}
+
+/// VK создаёт в библиотеке пользователя другую пару owner_id/audio_id после `audio.add`, поэтому
+/// совпадение с плейлистом ищем по метаданным и длительности.
+private func trackLibrarySimilarityKey(_ track: AudioTrack) -> String {
+    let a = track.artist.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let t = track.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return "\(a)|\(t)|\(track.duration ?? 0)"
 }
 
 final class AudioPlayerStore: ObservableObject {
     @Published var selectedTrackID: Int?
+    @Published var nowPlayingTrack: AudioTrack?
     @Published var isPlaying = false
     @Published var currentTime: Double = 0
     @Published var totalDuration: Double = 1
     @Published var isDownloading = false
     @Published var downloadedTrackIDs: Set<Int> = []
     @Published var playerError: String?
+    @Published var repeatOne = false
 
     private var player: AVPlayer?
     private var timeObserver: Any?
     private var selectedTrack: AudioTrack?
     private var isSeeking = false
     private var itemStatusObserver: NSKeyValueObservation?
+    private var playbackQueue: [AudioTrack] = []
+    private var currentQueueIndex: Int = 0
+    private var endPlaybackObserver: NSObjectProtocol?
 
     init() {
         setupAudioSession()
@@ -232,12 +331,58 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     deinit {
+        removeEndObserver()
         if let observer = timeObserver {
             player?.removeTimeObserver(observer)
         }
     }
 
-    func selectTrack(_ track: AudioTrack) {
+    private func removeEndObserver() {
+        if let endPlaybackObserver {
+            NotificationCenter.default.removeObserver(endPlaybackObserver)
+        }
+        endPlaybackObserver = nil
+    }
+
+    func resetForLogout() {
+        pause()
+        if let observer = timeObserver {
+            player?.removeTimeObserver(observer)
+            timeObserver = nil
+        }
+        removeEndObserver()
+        itemStatusObserver = nil
+        player = nil
+        selectedTrack = nil
+        nowPlayingTrack = nil
+        selectedTrackID = nil
+        isPlaying = false
+        currentTime = 0
+        totalDuration = 1
+        playerError = nil
+        playbackQueue = []
+        currentQueueIndex = 0
+        repeatOne = false
+    }
+
+    func selectTrack(_ track: AudioTrack, playlist: [AudioTrack]) {
+        guard let idx = playlist.firstIndex(where: { $0.id == track.id && $0.ownerID == track.ownerID }) else {
+            playbackQueue = [track]
+            currentQueueIndex = 0
+            loadCurrentTrack(track)
+            return
+        }
+        playbackQueue = playlist
+        currentQueueIndex = idx
+        loadAndPlayTrack(at: idx)
+    }
+
+    private func loadAndPlayTrack(at index: Int) {
+        guard index >= 0 && index < playbackQueue.count else { return }
+        loadCurrentTrack(playbackQueue[index])
+    }
+
+    private func loadCurrentTrack(_ track: AudioTrack) {
         guard let urlString = track.url, let url = URL(string: urlString) else {
             playerError = "Для этого трека нет URL воспроизведения."
             return
@@ -245,6 +390,7 @@ final class AudioPlayerStore: ObservableObject {
 
         playerError = nil
         selectedTrackID = track.id
+        nowPlayingTrack = track
         selectedTrack = track
         totalDuration = max(Double(track.duration ?? 1), 1)
         currentTime = 0
@@ -254,6 +400,7 @@ final class AudioPlayerStore: ObservableObject {
             timeObserver = nil
         }
         itemStatusObserver = nil
+        removeEndObserver()
 
         let item = AVPlayerItem(url: url)
         itemStatusObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] observedItem, _ in
@@ -267,7 +414,34 @@ final class AudioPlayerStore: ObservableObject {
         }
         player = AVPlayer(playerItem: item)
         addTimeObserver()
+
+        endPlaybackObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handlePlaybackReachedEnd()
+        }
+
         play()
+    }
+
+    private func handlePlaybackReachedEnd() {
+        if repeatOne {
+            player?.seek(to: .zero)
+            play()
+            return
+        }
+        if currentQueueIndex + 1 < playbackQueue.count {
+            currentQueueIndex += 1
+            loadAndPlayTrack(at: currentQueueIndex)
+        } else {
+            pause()
+            if let dur = player?.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
+                currentTime = dur
+                totalDuration = dur
+            }
+        }
     }
 
     func play() {
@@ -370,35 +544,277 @@ final class AudioPlayerStore: ObservableObject {
     }
 }
 
+private func formatPlaybackSeconds(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds >= 0 else { return "00:00" }
+    let total = Int(seconds.rounded())
+    let m = total / 60
+    let s = total % 60
+    return String(format: "%02d:%02d", m, s)
+}
+
+private struct NowPlayingControlsView: View {
+    @ObservedObject var playerStore: AudioPlayerStore
+
+    var body: some View {
+        if playerStore.selectedTrackID != nil {
+            VStack(spacing: 10) {
+                HStack(spacing: 12) {
+                    Slider(
+                        value: $playerStore.currentTime,
+                        in: 0...max(playerStore.totalDuration, 1),
+                        onEditingChanged: { editing in
+                            if editing {
+                                playerStore.beginSeeking()
+                            } else {
+                                playerStore.endSeeking()
+                            }
+                        }
+                    )
+
+                    Button {
+                        playerStore.repeatOne.toggle()
+                    } label: {
+                        Image(systemName: "repeat.1")
+                            .font(.title3)
+                            .foregroundColor(playerStore.repeatOne ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        playerStore.repeatOne ? "Повтор одного трека включён. Нажмите, чтобы выключить." : "Повтор одного трека выключен. Нажмите, чтобы включить."
+                    )
+                }
+
+                HStack {
+                    Text(formatPlaybackSeconds(playerStore.currentTime))
+                    Spacer()
+                    Text(formatPlaybackSeconds(playerStore.totalDuration))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+
+                HStack(spacing: 16) {
+                    Button(action: {
+                        playerStore.togglePlayPause()
+                    }) {
+                        Image(systemName: playerStore.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title2)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button(action: {
+                        playerStore.downloadSelectedTrackToCache()
+                    }) {
+                        if playerStore.isDownloading {
+                            ProgressView()
+                        } else {
+                            Text("Скачать в кэш")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            .padding()
+        }
+    }
+}
+
+private struct SearchTracksView: View {
+    @ObservedObject var authStore: VKAuthStore
+    @ObservedObject var playerStore: AudioPlayerStore
+
+    @State private var query = ""
+    @State private var results: [AudioTrack] = []
+    @State private var isSearching = false
+    @State private var searchError: String?
+    @State private var addingKeys: Set<String> = []
+
+    private var keysInLibrary: Set<String> {
+        Set(authStore.tracks.map(trackLibrarySimilarityKey))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NowPlayingControlsView(playerStore: playerStore)
+
+            Group {
+                if isSearching {
+                    ProgressView("Ищем…")
+                        .frame(maxHeight: .infinity)
+                } else if let searchError {
+                    ScrollView {
+                        Text(searchError)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                    }
+                } else if results.isEmpty {
+                    Spacer(minLength: 0)
+                    Text("Введите запрос и нажмите кнопку поиска справа.")
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.secondary)
+                        .padding()
+                    Spacer(minLength: 0)
+                } else {
+                    List(results, id: \.self) { track in
+                        searchRow(for: track)
+                    }
+                    .listStyle(InsetGroupedListStyle())
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if let playerError = playerStore.playerError {
+                Text(playerError)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+            }
+        }
+        .navigationTitle("Поиск")
+        .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 12) {
+                TextField("Поиск в VK", text: $query)
+                    .textFieldStyle(.roundedBorder)
+#if os(iOS)
+                    .submitLabel(.search)
+#endif
+                    .onSubmit {
+                        runSearch()
+                    }
+
+                Button(action: runSearch) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title3)
+                        .foregroundColor(Color.accentColor)
+                }
+                .disabled(trimmedQuery.isEmpty || isSearching)
+                .accessibilityLabel("Искать")
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
+            .background(.thinMaterial)
+        }
+    }
+
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func searchRow(for track: AudioTrack) -> some View {
+        let dedupeKey = trackLibrarySimilarityKey(track)
+        let isMine = keysInLibrary.contains(dedupeKey)
+        let addKey = trackPlaylistKey(track)
+        let isAdding = addingKeys.contains(addKey)
+
+        return HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(track.title)
+                    .font(.headline)
+                Text(track.artist)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Text(formatTrackDuration(track.duration))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+
+            if isMine {
+                Image(systemName: "flag.fill")
+                    .foregroundColor(.green)
+                    .accessibilityLabel("Уже в плейлисте")
+            }
+
+            if !isMine {
+                Button {
+                    addToPlaylist(track)
+                } label: {
+                    if isAdding {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                    } else {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(Color.accentColor)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Добавить в плейлист")
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            playerStore.selectTrack(track, playlist: results)
+        }
+    }
+
+    private func runSearch() {
+        let q = trimmedQuery
+        guard !q.isEmpty else { return }
+        searchError = nil
+        isSearching = true
+        authStore.searchTracks(query: q) { result in
+            isSearching = false
+            switch result {
+            case .success(let items):
+                results = items
+            case .failure(let err):
+                searchError = err.localizedDescription
+                results = []
+            }
+        }
+    }
+
+    private func addToPlaylist(_ track: AudioTrack) {
+        let key = trackPlaylistKey(track)
+        guard !addingKeys.contains(key) else { return }
+        addingKeys.insert(key)
+        authStore.addTrackToMyAudio(track) { result in
+            addingKeys.remove(key)
+            switch result {
+            case .success:
+                authStore.fetchTracks()
+            case .failure(let err):
+                searchError = err.localizedDescription
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var authStore = VKAuthStore()
     @StateObject private var playerStore = AudioPlayerStore()
     @State private var isAuthWebViewPresented = false
-    @State private var isManualTokenURLInputVisible = false
-    @State private var manualTokenURL = ""
 
     var body: some View {
         NavigationView {
-            Group {
-                switch authStore.screen {
-                case .auth:
-                    authView
-                case .songs:
-                    songsView
-                }
-            }
-            .navigationTitle(authStore.screen == .auth ? "Авторизация" : "Мои песни")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Group {
-                        if authStore.screen == .songs {
-                            Button(action: { authStore.logout() }) {
-                                Image(systemName: "square.and.arrow.right")
+            switch authStore.screen {
+            case .auth:
+                authView
+                    .navigationTitle("Авторизация")
+            case .songs:
+                songsView
+                    .navigationTitle("Мои песни")
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            NavigationLink(destination: SearchTracksView(authStore: authStore, playerStore: playerStore)) {
+                                Image(systemName: "magnifyingglass")
                             }
-                            .accessibilityLabel("Выйти")
+                            .accessibilityLabel("Поиск")
+                        }
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button("Выйти") {
+                                authStore.logout()
+                                playerStore.resetForLogout()
+                            }
+                            .accessibilityLabel("Выйти из аккаунта")
                         }
                     }
-                }
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
@@ -421,25 +837,6 @@ struct ContentView: View {
             .background(Color.blue)
             .foregroundColor(.white)
             .clipShape(Capsule())
-
-            Button(isManualTokenURLInputVisible ? "Скрыть ввод URL с токеном" : "Ставить URL с токеном") {
-                withAnimation {
-                    isManualTokenURLInputVisible.toggle()
-                }
-            }
-            .font(Font.system(size: 15))
-
-            if isManualTokenURLInputVisible {
-                VStack(spacing: 10) {
-                    TextField("Введите URL с токеном", text: $manualTokenURL)
-                        .padding(.horizontal, 24)
-
-                    Button("Загрузить песни по URL") {
-                        authStore.saveTokenFromURLString(manualTokenURL)
-                    }
-                    .disabled(manualTokenURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -459,43 +856,7 @@ struct ContentView: View {
 
     private var songsView: some View {
         VStack(spacing: 0) {
-            if playerStore.selectedTrackID != nil {
-                VStack(spacing: 12) {
-                    Slider(
-                        value: $playerStore.currentTime,
-                        in: 0...max(playerStore.totalDuration, 1),
-                        onEditingChanged: { editing in
-                            if editing {
-                                playerStore.beginSeeking()
-                            } else {
-                                playerStore.endSeeking()
-                            }
-                        }
-                    )
-
-                    HStack(spacing: 16) {
-                        Button(action: {
-                            playerStore.togglePlayPause()
-                        }) {
-                            Image(systemName: playerStore.isPlaying ? "pause.fill" : "play.fill")
-                                .font(.title2)
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button(action: {
-                            playerStore.downloadSelectedTrackToCache()
-                        }) {
-                            if playerStore.isDownloading {
-                                ProgressView()
-                            } else {
-                                Text("Скачать в кэш")
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding()
-            }
+            NowPlayingControlsView(playerStore: playerStore)
 
             if authStore.isLoading {
                 ProgressView("Загружаем песни...")
@@ -520,7 +881,10 @@ struct ContentView: View {
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                         }
-                        Spacer()
+                        Spacer(minLength: 8)
+                        Text(formatTrackDuration(track.duration))
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
                         if playerStore.isTrackDownloaded(track) {
                             Image(systemName: "arrow.down.circle.fill")
                                 .foregroundColor(.green)
@@ -539,7 +903,7 @@ struct ContentView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        playerStore.selectTrack(track)
+                        playerStore.selectTrack(track, playlist: authStore.tracks)
                     }
                 }
                 .listStyle(InsetGroupedListStyle())
