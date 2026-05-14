@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import WebKit
 import AVFoundation
+import MediaPlayer
 
 struct AudioTrack: Codable, Identifiable, Hashable {
     let id: Int
@@ -28,6 +29,7 @@ private struct VKAudioResponse: Decodable {
 }
 
 private struct VKAudioItems: Decodable {
+    let count: Int?
     let items: [AudioTrack]
 }
 
@@ -53,6 +55,8 @@ enum AppScreen {
 final class VKAuthStore: ObservableObject {
     private let tokenStorageKey = "vk_access_token"
     private let tracksStorageKey = "vk_tracks_cache"
+    /// Максимум записей за один вызов `audio.get` по документации VK.
+    private let audioGetPageSize = 6000
 
     @Published var accessToken: String = ""
     @Published var tracks: [AudioTrack] = []
@@ -91,38 +95,76 @@ final class VKAuthStore: ObservableObject {
 
         isLoading = true
 
-        let encodedToken = accessToken.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? accessToken
-        let urlString = "https://api.vk.com/method/audio.get?access_token=\(encodedToken)&v=5.131"
+        fetchTracksPage(offset: 0, accumulated: []) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isLoading = false
+                switch result {
+                case .success(let allTracks):
+                    self.tracks = allTracks
+                    self.cacheTracks(allTracks)
+                    self.errorMessage = nil
+                case .failure(let err):
+                    self.errorMessage = err.message
+                }
+            }
+        }
+    }
 
-        guard let url = URL(string: urlString) else {
-            isLoading = false
-            errorMessage = "Некорректный URL для запроса аудио."
+    /// Подгружает все страницы «Мои аудио» (`audio.get` с offset/count), иначе VK отдаёт только первую порцию.
+    private func fetchTracksPage(offset: Int, accumulated: [AudioTrack], completion: @escaping (Result<[AudioTrack], VKRequestError>) -> Void) {
+        guard !accessToken.isEmpty else {
+            completion(.success(accumulated))
+            return
+        }
+
+        var components = URLComponents(string: "https://api.vk.com/method/audio.get")
+        components?.queryItems = [
+            URLQueryItem(name: "offset", value: String(offset)),
+            URLQueryItem(name: "count", value: String(audioGetPageSize)),
+            URLQueryItem(name: "access_token", value: accessToken),
+            URLQueryItem(name: "v", value: "5.131")
+        ]
+
+        guard let url = components?.url else {
+            completion(.failure(VKRequestError(message: "Некорректный URL для запроса аудио.")))
             return
         }
 
         URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.isLoading = false
+            guard let self else {
+                completion(.failure(VKRequestError(message: "Не удалось обновить список песен. Показаны сохранённые треки.")))
+                return
+            }
 
-                if let error = error {
-                    self.errorMessage = "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки."
-                    return
-                }
+            if let error = error {
+                completion(.failure(VKRequestError(message: "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки.")))
+                return
+            }
 
-                guard let data = data else {
-                    self.errorMessage = "Не удалось обновить список песен: пустой ответ. Показаны сохранённые треки."
-                    return
-                }
+            guard let data = data else {
+                completion(.failure(VKRequestError(message: "Не удалось обновить список песен: пустой ответ. Показаны сохранённые треки.")))
+                return
+            }
 
-                do {
-                    let decoded = try JSONDecoder().decode(VKAudioResponse.self, from: data)
-                    self.tracks = decoded.response.items
-                    self.cacheTracks(decoded.response.items)
-                    self.errorMessage = nil
-                } catch {
-                    self.errorMessage = "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки."
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let vkError = obj["error"] as? [String: Any],
+               let msg = vkError["error_msg"] as? String {
+                completion(.failure(VKRequestError(message: "VK: \(msg). Показаны сохранённые треки.")))
+                return
+            }
+
+            do {
+                let decoded = try JSONDecoder().decode(VKAudioResponse.self, from: data)
+                let page = decoded.response.items
+                let merged = accumulated + page
+                if page.count == self.audioGetPageSize {
+                    self.fetchTracksPage(offset: offset + page.count, accumulated: merged, completion: completion)
+                } else {
+                    completion(.success(merged))
                 }
+            } catch {
+                completion(.failure(VKRequestError(message: "Не удалось обновить список песен: \(error.localizedDescription). Показаны сохранённые треки.")))
             }
         }.resume()
     }
@@ -350,6 +392,7 @@ final class AudioPlayerStore: ObservableObject {
 
     init() {
         setupAudioSession()
+        configureRemoteTransportControls()
     }
 
     private func setupAudioSession() {
@@ -402,6 +445,7 @@ final class AudioPlayerStore: ObservableObject {
         queuePlayer?.pause()
         queuePlayer = nil
         itemTrackIndex.removeAll()
+        clearNowPlaying()
     }
 
     func resetForLogout() {
@@ -456,6 +500,7 @@ final class AudioPlayerStore: ObservableObject {
                 if observedItem.status == .failed {
                     self.playerError = observedItem.error?.localizedDescription ?? "Не удалось начать воспроизведение."
                     self.isPlaying = false
+                    self.clearNowPlaying()
                 }
             }
         }
@@ -488,6 +533,7 @@ final class AudioPlayerStore: ObservableObject {
                         guard let self, finished else { return }
                         self.queuePlayer?.play()
                         self.isPlaying = true
+                        self.updateNowPlayingInfo()
                     }
                 }
             }
@@ -503,6 +549,7 @@ final class AudioPlayerStore: ObservableObject {
                 self.currentTime = dur
                 self.totalDuration = dur
             }
+            self.updateNowPlayingInfo()
         }
     }
 
@@ -529,6 +576,7 @@ final class AudioPlayerStore: ObservableObject {
             currentTime = 0
         }
         topUpForwardBuffer()
+        updateNowPlayingInfo()
     }
 
     /// Держим в очереди текущий и следующий трек (следующий стартует без участия main).
@@ -600,6 +648,7 @@ final class AudioPlayerStore: ObservableObject {
         } else {
             topUpForwardBuffer()
         }
+        updateNowPlayingInfo()
     }
 
     private func trimQueuedItemsAfterCurrent() {
@@ -614,14 +663,124 @@ final class AudioPlayerStore: ObservableObject {
         attachPlayToEndObserver(currentItem, trackIndex: idx)
     }
 
+    private func configureRemoteTransportControls() {
+        let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
+        center.playCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.play()
+            }
+            return .success
+        }
+        center.pauseCommand.isEnabled = true
+        center.pauseCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.pause()
+            }
+            return .success
+        }
+        center.togglePlayPauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.togglePlayPause()
+            }
+            return .success
+        }
+        center.changePlaybackPositionCommand.isEnabled = true
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let self, let e = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            DispatchQueue.main.async {
+                self.seek(to: e.positionTime)
+            }
+            return .success
+        }
+        center.nextTrackCommand.isEnabled = true
+        center.nextTrackCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.skipToNextTrack()
+            }
+            return .success
+        }
+        center.previousTrackCommand.isEnabled = true
+        center.previousTrackCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.skipToPreviousTrack()
+            }
+            return .success
+        }
+    }
+
+    private func clearNowPlaying() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.clearNowPlaying() }
+            return
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    private func updateNowPlayingInfo() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.updateNowPlayingInfo() }
+            return
+        }
+        guard let track = nowPlayingTrack else {
+            clearNowPlaying()
+            return
+        }
+        let durationSeconds: Double = {
+            if totalDuration.isFinite, totalDuration > 0 { return totalDuration }
+            let d = Double(track.duration ?? 0)
+            return d > 0 ? d : 1
+        }()
+        let elapsed = min(max(0, currentTime), durationSeconds)
+
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: track.title,
+            MPMediaItemPropertyArtist: track.artist,
+            MPMediaItemPropertyPlaybackDuration: durationSeconds,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyMediaType: NSNumber(value: MPNowPlayingInfoMediaType.audio.rawValue)
+        ]
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+
+        let commands = MPRemoteCommandCenter.shared()
+        let canNext = !repeatOne && currentQueueIndex + 1 < playbackQueue.count
+        commands.nextTrackCommand.isEnabled = canNext
+        commands.previousTrackCommand.isEnabled = true
+    }
+
+    private func skipToNextTrack() {
+        guard !repeatOne else { return }
+        let next = currentQueueIndex + 1
+        guard next < playbackQueue.count else { return }
+        loadCurrentTrack(at: next)
+    }
+
+    private func skipToPreviousTrack() {
+        guard !playbackQueue.isEmpty else { return }
+        if currentTime > 3 {
+            seek(to: 0)
+            return
+        }
+        if currentQueueIndex > 0 {
+            loadCurrentTrack(at: currentQueueIndex - 1)
+        } else {
+            seek(to: 0)
+        }
+    }
+
     func play() {
         queuePlayer?.play()
         isPlaying = true
+        updateNowPlayingInfo()
     }
 
     func pause() {
         queuePlayer?.pause()
         isPlaying = false
+        updateNowPlayingInfo()
     }
 
     func togglePlayPause() {
@@ -638,8 +797,21 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     func seek(to seconds: Double) {
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        queuePlayer?.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        guard let player = queuePlayer else { return }
+        let durationSeconds: Double = {
+            if totalDuration.isFinite, totalDuration > 0 { return totalDuration }
+            if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { return d }
+            return 1
+        }()
+        let clamped = min(max(0, seconds), durationSeconds)
+        let target = CMTime(seconds: clamped, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            guard let self, finished else { return }
+            DispatchQueue.main.async {
+                self.currentTime = clamped
+                self.updateNowPlayingInfo()
+            }
+        }
     }
 
     func isTrackDownloaded(_ track: AudioTrack) -> Bool {
@@ -702,6 +874,7 @@ final class AudioPlayerStore: ObservableObject {
             if let itemDuration = self.queuePlayer?.currentItem?.duration.seconds, itemDuration.isFinite, itemDuration > 0 {
                 self.totalDuration = itemDuration
             }
+            self.updateNowPlayingInfo()
         }
     }
 
