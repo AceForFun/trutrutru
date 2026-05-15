@@ -955,18 +955,23 @@ private func formatPlaybackSeconds(_ seconds: Double) -> String {
 }
 
 private struct NowPlayingControlsView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ObservedObject var playerStore: AudioPlayerStore
     @ObservedObject var playbackProgress: PlaybackProgressModel
     var showDownloadToCache: Bool = true
 
+    private var usesCompactControls: Bool {
+        horizontalSizeClass == .compact
+    }
+
     var body: some View {
         if playerStore.selectedTrackID != nil {
-            VStack(spacing: 10) {
+            VStack(spacing: usesCompactControls ? 8 : 10) {
                 if let track = playerStore.nowPlayingTrack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(track.title)
                             .font(.headline)
-                            .lineLimit(2)
+                            .lineLimit(usesCompactControls ? 1 : 2)
                             .multilineTextAlignment(.leading)
                         Text(track.artist)
                             .font(.subheadline)
@@ -976,41 +981,32 @@ private struct NowPlayingControlsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                HStack(spacing: 12) {
-                    Slider(
-                        value: $playbackProgress.currentTime,
-                        in: 0...max(playbackProgress.totalDuration, 1),
-                        onEditingChanged: { editing in
-                            if editing {
-                                playerStore.beginSeeking()
-                            } else {
-                                playerStore.endSeeking()
-                            }
-                        }
-                    )
-
-                    Button {
-                        playerStore.toggleRepeatOne()
-                    } label: {
-                        Image(systemName: "repeat.1")
-                            .font(.title3)
-                            .foregroundColor(playerStore.repeatOne ? Color.accentColor : Color.secondary)
+                if usesCompactControls {
+                    playbackSlider
+                    HStack(spacing: 8) {
+                        Text(formatPlaybackSeconds(playbackProgress.currentTime))
+                        Spacer(minLength: 4)
+                        repeatOneButton
+                        Spacer(minLength: 4)
+                        Text(formatPlaybackSeconds(playbackProgress.totalDuration))
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(
-                        playerStore.repeatOne ? "Повтор одного трека включён. Нажмите, чтобы выключить." : "Повтор одного трека выключен. Нажмите, чтобы включить."
-                    )
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(.secondary)
+                } else {
+                    HStack(spacing: 12) {
+                        playbackSlider
+                        repeatOneButton
+                    }
+                    HStack {
+                        Text(formatPlaybackSeconds(playbackProgress.currentTime))
+                        Spacer()
+                        Text(formatPlaybackSeconds(playbackProgress.totalDuration))
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(.secondary)
                 }
 
-                HStack {
-                    Text(formatPlaybackSeconds(playbackProgress.currentTime))
-                    Spacer()
-                    Text(formatPlaybackSeconds(playbackProgress.totalDuration))
-                }
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-
-                HStack(spacing: 16) {
+                HStack(spacing: 12) {
                     Button(action: {
                         playerStore.togglePlayPause()
                     }) {
@@ -1025,6 +1021,9 @@ private struct NowPlayingControlsView: View {
                         }) {
                             if playerStore.isDownloading {
                                 ProgressView()
+                            } else if usesCompactControls {
+                                Label("В кэш", systemImage: "arrow.down.circle")
+                                    .font(.subheadline)
                             } else {
                                 Text("Скачать в кэш")
                             }
@@ -1033,8 +1032,50 @@ private struct NowPlayingControlsView: View {
                     }
                 }
             }
-            .padding()
+            .padding(.horizontal, 16)
+            .padding(.vertical, usesCompactControls ? 10 : 12)
         }
+    }
+
+    private var playbackSlider: some View {
+        Slider(
+            value: $playbackProgress.currentTime,
+            in: 0...max(playbackProgress.totalDuration, 1),
+            onEditingChanged: { editing in
+                if editing {
+                    playerStore.beginSeeking()
+                } else {
+                    playerStore.endSeeking()
+                }
+            }
+        )
+    }
+
+    private var repeatOneButton: some View {
+        Button {
+            playerStore.toggleRepeatOne()
+        } label: {
+            Image(systemName: "repeat.1")
+                .font(.title3)
+                .foregroundColor(playerStore.repeatOne ? Color.accentColor : Color.secondary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            playerStore.repeatOne ? "Повтор одного трека включён. Нажмите, чтобы выключить." : "Повтор одного трека выключен. Нажмите, чтобы включить."
+        )
+    }
+}
+
+private struct NowPlayingChromeBar<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        content()
+            .frame(maxWidth: .infinity)
+            .background(.thinMaterial)
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
     }
 }
 
@@ -1053,70 +1094,80 @@ private struct SearchTracksView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if playerStore.nowPlayingChrome == .search {
-                NowPlayingControlsView(playerStore: playerStore, playbackProgress: playerStore.playbackProgress, showDownloadToCache: false)
-            }
-
-            Group {
-                if isSearching {
-                    ProgressView("Ищем…")
-                        .frame(maxHeight: .infinity)
-                } else if let searchError {
-                    ScrollView {
-                        Text(searchError)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                            .padding()
-                    }
-                } else if results.isEmpty {
-                    Spacer(minLength: 0)
-                    Text("Введите запрос и нажмите кнопку поиска справа.")
+        Group {
+            if isSearching {
+                ProgressView("Ищем…")
+                    .frame(maxHeight: .infinity)
+            } else if let searchError {
+                ScrollView {
+                    Text(searchError)
+                        .foregroundColor(.red)
                         .multilineTextAlignment(.center)
-                        .foregroundColor(.secondary)
                         .padding()
-                    Spacer(minLength: 0)
-                } else {
-                    List(results, id: \.self) { track in
-                        searchRow(for: track)
-                    }
-                    .listStyle(InsetGroupedListStyle())
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if let playerError = playerStore.playerError {
-                Text(playerError)
-                    .font(.footnote)
-                    .foregroundColor(.red)
-                    .padding(.horizontal)
-                    .padding(.bottom, 4)
+            } else if results.isEmpty {
+                Spacer(minLength: 0)
+                Text("Введите запрос и нажмите кнопку поиска справа.")
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.secondary)
+                    .padding()
+                Spacer(minLength: 0)
+            } else {
+                List(results, id: \.self) { track in
+                    searchRow(for: track)
+                }
+                .listStyle(InsetGroupedListStyle())
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Поиск")
         .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            HStack(spacing: 12) {
-                TextField("Поиск в VK", text: $query)
-                    .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                    .submitLabel(.search)
-#endif
-                    .onSubmit {
-                        runSearch()
-                    }
-
-                Button(action: runSearch) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.title3)
-                        .foregroundColor(Color.accentColor)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if playerStore.nowPlayingChrome == .search {
+                NowPlayingChromeBar {
+                    NowPlayingControlsView(
+                        playerStore: playerStore,
+                        playbackProgress: playerStore.playbackProgress,
+                        showDownloadToCache: false
+                    )
                 }
-                .disabled(trimmedQuery.isEmpty || isSearching)
-                .accessibilityLabel("Искать")
-                .buttonStyle(.plain)
             }
-            .padding(.horizontal)
-            .padding(.vertical, 12)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                if let playerError = playerStore.playerError {
+                    Text(playerError)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity)
+                }
+
+                HStack(spacing: 12) {
+                    TextField("Поиск в VK", text: $query)
+                        .textFieldStyle(.roundedBorder)
+#if os(iOS)
+                        .submitLabel(.search)
+#endif
+                        .onSubmit {
+                            runSearch()
+                        }
+
+                    Button(action: runSearch) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.title3)
+                            .foregroundColor(Color.accentColor)
+                    }
+                    .disabled(trimmedQuery.isEmpty || isSearching)
+                    .accessibilityLabel("Искать")
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 12)
+            }
+            .frame(maxWidth: .infinity)
             .background(.thinMaterial)
         }
         .onAppear {
@@ -1141,16 +1192,20 @@ private struct SearchTracksView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(track.title)
                     .font(.headline)
+                    .lineLimit(1)
                 Text(track.artist)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
             }
+            .layoutPriority(1)
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 4)
 
             Text(formatTrackDuration(track.duration))
                 .font(.caption.monospacedDigit())
                 .foregroundColor(.secondary)
+                .fixedSize()
 
             if isMine {
                 Image(systemName: "flag.fill")
@@ -1230,14 +1285,18 @@ private struct MySongsTrackListView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(track.title)
                             .font(.headline)
+                            .lineLimit(1)
                         Text(track.artist)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
                     }
-                    Spacer(minLength: 8)
+                    .layoutPriority(1)
+                    Spacer(minLength: 4)
                     Text(formatTrackDuration(track.duration))
                         .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
+                        .fixedSize()
                     if trackListSnapshot.showsDownloadBadge(for: track) {
                         Image(systemName: "arrow.down.circle.fill")
                             .foregroundColor(.green)
@@ -1309,7 +1368,7 @@ struct ContentView: View {
                 songsView
                     .navigationTitle("Музыка VK")
                     .toolbar {
-                        ToolbarItem(placement: .navigationBarLeading) {
+                        ToolbarItemGroup(placement: .navigationBarLeading) {
                             Button {
                                 isNowPlayingControlsHidden.toggle()
                             } label: {
@@ -1320,8 +1379,7 @@ struct ContentView: View {
                                     ? "Показать панель плеера"
                                     : "Скрыть панель плеера"
                             )
-                        }
-                        ToolbarItem(placement: .navigationBarLeading) {
+
                             NavigationLink(destination: SearchTracksView(authStore: authStore, playerStore: playerStore)) {
                                 Image(systemName: "magnifyingglass")
                             }
@@ -1361,25 +1419,33 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(isPresented: $isAuthWebViewPresented) {
-            VKAuthWebView(
-                onSuccess: { token in
-                    authStore.saveToken(token)
-                    isAuthWebViewPresented = false
-                },
-                onFailure: { error in
-                    authStore.errorMessage = error.localizedDescription
-                    isAuthWebViewPresented = false
+            NavigationView {
+                VKAuthWebView(
+                    onSuccess: { token in
+                        authStore.saveToken(token)
+                        isAuthWebViewPresented = false
+                    },
+                    onFailure: { error in
+                        authStore.errorMessage = error.localizedDescription
+                        isAuthWebViewPresented = false
+                    }
+                )
+                .navigationTitle("Вход в VK")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Закрыть") {
+                            isAuthWebViewPresented = false
+                        }
+                    }
                 }
-            )
+            }
+            .navigationViewStyle(StackNavigationViewStyle())
         }
     }
 
     private var songsView: some View {
-        VStack(spacing: 0) {
-            if playerStore.nowPlayingChrome == .mySongs && !isNowPlayingControlsHidden {
-                NowPlayingControlsView(playerStore: playerStore, playbackProgress: playerStore.playbackProgress)
-            }
-
+        Group {
             if authStore.isLoading {
                 ProgressView("Загружаем песни...")
             } else if let error = authStore.errorMessage {
@@ -1400,13 +1466,28 @@ struct ContentView: View {
                     playerStore: playerStore
                 )
             }
-
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if playerStore.nowPlayingChrome == .mySongs && !isNowPlayingControlsHidden {
+                NowPlayingChromeBar {
+                    NowPlayingControlsView(
+                        playerStore: playerStore,
+                        playbackProgress: playerStore.playbackProgress
+                    )
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if let playerError = playerStore.playerError {
                 Text(playerError)
                     .font(.footnote)
                     .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
                     .padding(.horizontal)
-                    .padding(.bottom, 8)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity)
+                    .background(.thinMaterial)
             }
         }
     }
@@ -1528,5 +1609,11 @@ enum VKAuthError: LocalizedError {
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView()
+            .previewDevice(PreviewDevice(rawValue: "iPhone 16"))
+            .previewDisplayName("iPhone 16")
+
+        ContentView()
+            .previewDevice(PreviewDevice(rawValue: "iPhone 16 Pro Max"))
+            .previewDisplayName("iPhone 16 Pro Max")
     }
 }
