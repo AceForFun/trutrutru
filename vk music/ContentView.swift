@@ -347,6 +347,12 @@ private func trackPlaylistKey(_ track: AudioTrack) -> String {
     "\(track.ownerID)_\(track.id)"
 }
 
+private func audioTrackCacheURL(_ track: AudioTrack) -> URL {
+    FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("track-cache")
+        .appendingPathComponent("\(track.ownerID)_\(track.id).mp3")
+}
+
 /// VK создаёт в библиотеке пользователя другую пару owner_id/audio_id после `audio.add`, поэтому
 /// совпадение с плейлистом ищем по метаданным и длительности.
 private func trackLibrarySimilarityKey(_ track: AudioTrack) -> String {
@@ -362,13 +368,49 @@ enum NowPlayingChrome: Equatable {
     case search
 }
 
+/// Прогресс воспроизведения вынесен отдельно, чтобы обновления ~2×/с не инвалидировали весь `ContentView` и список треков.
+final class PlaybackProgressModel: ObservableObject {
+    @Published var currentTime: Double = 0
+    @Published var totalDuration: Double = 1
+}
+
+/// Состояние, от которого зависят строки списка «Мои песни»: смена трека, play/pause, набор скачанных id.
+/// Отделено от `AudioPlayerStore`, чтобы список не подписывался на весь плеер и не перерисовывался из‑за прочих `@Published`.
+final class TrackListPlayerSnapshot: ObservableObject {
+    @Published private(set) var nowPlayingOwnerID: Int?
+    @Published private(set) var nowPlayingTrackID: Int?
+    @Published private(set) var isPlaying: Bool = false
+    @Published private(set) var downloadedTrackIDs: Set<Int> = []
+
+    func updateFromPlayer(nowPlayingTrack: AudioTrack?, isPlaying: Bool, downloadedTrackIDs: Set<Int>) {
+        let o = nowPlayingTrack?.ownerID
+        let t = nowPlayingTrack?.id
+        if nowPlayingOwnerID == o, nowPlayingTrackID == t, self.isPlaying == isPlaying, self.downloadedTrackIDs == downloadedTrackIDs {
+            return
+        }
+        nowPlayingOwnerID = o
+        nowPlayingTrackID = t
+        self.isPlaying = isPlaying
+        self.downloadedTrackIDs = downloadedTrackIDs
+    }
+
+    func isPlayingRow(_ track: AudioTrack) -> Bool {
+        nowPlayingTrackID == track.id && nowPlayingOwnerID == track.ownerID
+    }
+
+    func showsDownloadBadge(for track: AudioTrack) -> Bool {
+        if downloadedTrackIDs.contains(track.id) { return true }
+        return FileManager.default.fileExists(atPath: audioTrackCacheURL(track).path)
+    }
+}
+
 final class AudioPlayerStore: ObservableObject {
     @Published var nowPlayingChrome: NowPlayingChrome = .hidden
     @Published var selectedTrackID: Int?
     @Published var nowPlayingTrack: AudioTrack?
     @Published var isPlaying = false
-    @Published var currentTime: Double = 0
-    @Published var totalDuration: Double = 1
+    let playbackProgress = PlaybackProgressModel()
+    let trackListSnapshot = TrackListPlayerSnapshot()
     @Published var isDownloading = false
     @Published var downloadedTrackIDs: Set<Int> = []
     @Published var playerError: String?
@@ -393,6 +435,14 @@ final class AudioPlayerStore: ObservableObject {
     init() {
         setupAudioSession()
         configureRemoteTransportControls()
+    }
+
+    private func syncTrackListPlaybackSnapshot() {
+        trackListSnapshot.updateFromPlayer(
+            nowPlayingTrack: nowPlayingTrack,
+            isPlaying: isPlaying,
+            downloadedTrackIDs: downloadedTrackIDs
+        )
     }
 
     private func setupAudioSession() {
@@ -454,13 +504,14 @@ final class AudioPlayerStore: ObservableObject {
         nowPlayingTrack = nil
         selectedTrackID = nil
         isPlaying = false
-        currentTime = 0
-        totalDuration = 1
+        playbackProgress.currentTime = 0
+        playbackProgress.totalDuration = 1
         playerError = nil
         playbackQueue = []
         currentQueueIndex = 0
         repeatOne = false
         nowPlayingChrome = .hidden
+        syncTrackListPlaybackSnapshot()
     }
 
     /// Скрыть слайдер (например при открытии поиска или возврате с него); плеер не трогаем.
@@ -501,6 +552,7 @@ final class AudioPlayerStore: ObservableObject {
                     self.playerError = observedItem.error?.localizedDescription ?? "Не удалось начать воспроизведение."
                     self.isPlaying = false
                     self.clearNowPlaying()
+                    self.syncTrackListPlaybackSnapshot()
                 }
             }
         }
@@ -534,6 +586,7 @@ final class AudioPlayerStore: ObservableObject {
                         self.queuePlayer?.play()
                         self.isPlaying = true
                         self.updateNowPlayingInfo()
+                        self.syncTrackListPlaybackSnapshot()
                     }
                 }
             }
@@ -546,8 +599,8 @@ final class AudioPlayerStore: ObservableObject {
             guard let self else { return }
             self.pause()
             if let dur = self.queuePlayer?.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
-                self.currentTime = dur
-                self.totalDuration = dur
+                self.playbackProgress.currentTime = dur
+                self.playbackProgress.totalDuration = dur
             }
             self.updateNowPlayingInfo()
         }
@@ -571,12 +624,13 @@ final class AudioPlayerStore: ObservableObject {
         selectedTrackID = track.id
         nowPlayingTrack = track
         selectedTrack = track
-        totalDuration = max(Double(track.duration ?? 1), 1)
+        playbackProgress.totalDuration = max(Double(track.duration ?? 1), 1)
         if trackChanged {
-            currentTime = 0
+            playbackProgress.currentTime = 0
         }
         topUpForwardBuffer()
         updateNowPlayingInfo()
+        syncTrackListPlaybackSnapshot()
     }
 
     /// Держим в очереди текущий и следующий трек (следующий стартует без участия main).
@@ -633,8 +687,8 @@ final class AudioPlayerStore: ObservableObject {
         selectedTrackID = track.id
         nowPlayingTrack = track
         selectedTrack = track
-        totalDuration = max(Double(track.duration ?? 1), 1)
-        currentTime = 0
+        playbackProgress.totalDuration = max(Double(track.duration ?? 1), 1)
+        playbackProgress.currentTime = 0
 
         topUpForwardBuffer()
         play()
@@ -728,11 +782,12 @@ final class AudioPlayerStore: ObservableObject {
             return
         }
         let durationSeconds: Double = {
-            if totalDuration.isFinite, totalDuration > 0 { return totalDuration }
+            let td = playbackProgress.totalDuration
+            if td.isFinite, td > 0 { return td }
             let d = Double(track.duration ?? 0)
             return d > 0 ? d : 1
         }()
-        let elapsed = min(max(0, currentTime), durationSeconds)
+        let elapsed = min(max(0, playbackProgress.currentTime), durationSeconds)
 
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
@@ -760,7 +815,7 @@ final class AudioPlayerStore: ObservableObject {
 
     private func skipToPreviousTrack() {
         guard !playbackQueue.isEmpty else { return }
-        if currentTime > 3 {
+        if playbackProgress.currentTime > 3 {
             seek(to: 0)
             return
         }
@@ -775,12 +830,14 @@ final class AudioPlayerStore: ObservableObject {
         queuePlayer?.play()
         isPlaying = true
         updateNowPlayingInfo()
+        syncTrackListPlaybackSnapshot()
     }
 
     func pause() {
         queuePlayer?.pause()
         isPlaying = false
         updateNowPlayingInfo()
+        syncTrackListPlaybackSnapshot()
     }
 
     func togglePlayPause() {
@@ -792,14 +849,15 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     func endSeeking() {
-        seek(to: currentTime)
+        seek(to: playbackProgress.currentTime)
         isSeeking = false
     }
 
     func seek(to seconds: Double) {
         guard let player = queuePlayer else { return }
         let durationSeconds: Double = {
-            if totalDuration.isFinite, totalDuration > 0 { return totalDuration }
+            let td = playbackProgress.totalDuration
+            if td.isFinite, td > 0 { return td }
             if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { return d }
             return 1
         }()
@@ -808,7 +866,7 @@ final class AudioPlayerStore: ObservableObject {
         player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             guard let self, finished else { return }
             DispatchQueue.main.async {
-                self.currentTime = clamped
+                self.playbackProgress.currentTime = clamped
                 self.updateNowPlayingInfo()
             }
         }
@@ -857,6 +915,7 @@ final class AudioPlayerStore: ObservableObject {
                     }
                     try fm.moveItem(at: tempURL, to: destinationURL)
                     self.downloadedTrackIDs.insert(track.id)
+                    self.syncTrackListPlaybackSnapshot()
                 } catch {
                     self.playerError = "Ошибка сохранения в кэш: \(error.localizedDescription)"
                 }
@@ -869,10 +928,10 @@ final class AudioPlayerStore: ObservableObject {
         timeObserver = queuePlayer?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self = self else { return }
             if !self.isSeeking {
-                self.currentTime = time.seconds.isFinite ? time.seconds : 0
+                self.playbackProgress.currentTime = time.seconds.isFinite ? time.seconds : 0
             }
             if let itemDuration = self.queuePlayer?.currentItem?.duration.seconds, itemDuration.isFinite, itemDuration > 0 {
-                self.totalDuration = itemDuration
+                self.playbackProgress.totalDuration = itemDuration
             }
             self.updateNowPlayingInfo()
         }
@@ -883,7 +942,7 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     private func cacheURL(for track: AudioTrack) -> URL {
-        trackCacheDirectory().appendingPathComponent("\(track.ownerID)_\(track.id).mp3")
+        audioTrackCacheURL(track)
     }
 }
 
@@ -897,6 +956,7 @@ private func formatPlaybackSeconds(_ seconds: Double) -> String {
 
 private struct NowPlayingControlsView: View {
     @ObservedObject var playerStore: AudioPlayerStore
+    @ObservedObject var playbackProgress: PlaybackProgressModel
     var showDownloadToCache: Bool = true
 
     var body: some View {
@@ -918,8 +978,8 @@ private struct NowPlayingControlsView: View {
 
                 HStack(spacing: 12) {
                     Slider(
-                        value: $playerStore.currentTime,
-                        in: 0...max(playerStore.totalDuration, 1),
+                        value: $playbackProgress.currentTime,
+                        in: 0...max(playbackProgress.totalDuration, 1),
                         onEditingChanged: { editing in
                             if editing {
                                 playerStore.beginSeeking()
@@ -943,9 +1003,9 @@ private struct NowPlayingControlsView: View {
                 }
 
                 HStack {
-                    Text(formatPlaybackSeconds(playerStore.currentTime))
+                    Text(formatPlaybackSeconds(playbackProgress.currentTime))
                     Spacer()
-                    Text(formatPlaybackSeconds(playerStore.totalDuration))
+                    Text(formatPlaybackSeconds(playbackProgress.totalDuration))
                 }
                 .font(.caption.monospacedDigit())
                 .foregroundColor(.secondary)
@@ -995,7 +1055,7 @@ private struct SearchTracksView: View {
     var body: some View {
         VStack(spacing: 0) {
             if playerStore.nowPlayingChrome == .search {
-                NowPlayingControlsView(playerStore: playerStore, showDownloadToCache: false)
+                NowPlayingControlsView(playerStore: playerStore, playbackProgress: playerStore.playbackProgress, showDownloadToCache: false)
             }
 
             Group {
@@ -1154,9 +1214,86 @@ private struct SearchTracksView: View {
     }
 }
 
-struct ContentView: View {
+/// Список «Мои песни»: подписан только на `VKAuthStore` и узкий `TrackListPlayerSnapshot`.
+/// `AudioPlayerStore` передан как `let` без `@ObservedObject`, чтобы не перерисовывать строки при прочих изменениях плеера.
+private struct MySongsTrackListView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject var authStore: VKAuthStore
+    @ObservedObject var trackListSnapshot: TrackListPlayerSnapshot
+    let playerStore: AudioPlayerStore
 
+    var body: some View {
+        ScrollViewReader { proxy in
+            List(authStore.tracks) { track in
+                let playing = trackListSnapshot.isPlayingRow(track)
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(track.title)
+                            .font(.headline)
+                        Text(track.artist)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Text(formatTrackDuration(track.duration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.secondary)
+                    if trackListSnapshot.showsDownloadBadge(for: track) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundColor(.green)
+                    }
+                    Button(role: .destructive) {
+                        authStore.deleteTrack(track)
+                    } label: {
+                        if authStore.deletingTrackIDs.contains(track.id) {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                        } else {
+                            Image(systemName: "trash")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    playerStore.selectTrack(track, playlist: authStore.tracks, chrome: .mySongs)
+                }
+                .listRowBackground(
+                    playing
+                        ? Color.accentColor.opacity(0.12)
+                        : nil
+                )
+                .id(mySongsRowId(track))
+            }
+            .listStyle(InsetGroupedListStyle())
+            .onChange(of: scenePhase) { phase in
+                if phase == .active {
+                    scrollNowPlayingRowIntoView(using: proxy)
+                }
+            }
+        }
+    }
+
+    private func mySongsRowId(_ track: AudioTrack) -> String {
+        "my_songs_\(track.ownerID)_\(track.id)"
+    }
+
+    private func scrollNowPlayingRowIntoView(using proxy: ScrollViewProxy) {
+        guard let oid = trackListSnapshot.nowPlayingOwnerID,
+              let tid = trackListSnapshot.nowPlayingTrackID else { return }
+        guard authStore.tracks.contains(where: { $0.id == tid && $0.ownerID == oid }) else {
+            return
+        }
+        let targetId = "my_songs_\(oid)_\(tid)"
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(targetId, anchor: .center)
+            }
+        }
+    }
+}
+
+struct ContentView: View {
     @StateObject private var authStore = VKAuthStore()
     @StateObject private var playerStore = AudioPlayerStore()
     @State private var isAuthWebViewPresented = false
@@ -1240,7 +1377,7 @@ struct ContentView: View {
     private var songsView: some View {
         VStack(spacing: 0) {
             if playerStore.nowPlayingChrome == .mySongs && !isNowPlayingControlsHidden {
-                NowPlayingControlsView(playerStore: playerStore)
+                NowPlayingControlsView(playerStore: playerStore, playbackProgress: playerStore.playbackProgress)
             }
 
             if authStore.isLoading {
@@ -1257,55 +1394,11 @@ struct ContentView: View {
             } else if authStore.tracks.isEmpty {
                 Text("Список песен пуст.")
             } else {
-                ScrollViewReader { proxy in
-                    List(authStore.tracks) { track in
-                        let playing = isNowPlayingTrack(track)
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(track.title)
-                                    .font(.headline)
-                                Text(track.artist)
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                            }
-                            Spacer(minLength: 8)
-                            Text(formatTrackDuration(track.duration))
-                                .font(.caption.monospacedDigit())
-                                .foregroundColor(.secondary)
-                            if playerStore.isTrackDownloaded(track) {
-                                Image(systemName: "arrow.down.circle.fill")
-                                    .foregroundColor(.green)
-                            }
-                            Button(role: .destructive) {
-                                authStore.deleteTrack(track)
-                            } label: {
-                                if authStore.deletingTrackIDs.contains(track.id) {
-                                    ProgressView()
-                                        .progressViewStyle(.circular)
-                                } else {
-                                    Image(systemName: "trash")
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            playerStore.selectTrack(track, playlist: authStore.tracks, chrome: .mySongs)
-                        }
-                        .listRowBackground(
-                            playing
-                                ? Color.accentColor.opacity(0.12)
-                                : nil
-                        )
-                        .id(mySongsRowId(track))
-                    }
-                    .listStyle(InsetGroupedListStyle())
-                    .onChange(of: scenePhase) { phase in
-                        if phase == .active {
-                            scrollNowPlayingRowIntoView(using: proxy)
-                        }
-                    }
-                }
+                MySongsTrackListView(
+                    authStore: authStore,
+                    trackListSnapshot: playerStore.trackListSnapshot,
+                    playerStore: playerStore
+                )
             }
 
             if let playerError = playerStore.playerError {
@@ -1314,28 +1407,6 @@ struct ContentView: View {
                     .foregroundColor(.red)
                     .padding(.horizontal)
                     .padding(.bottom, 8)
-            }
-        }
-    }
-
-    private func mySongsRowId(_ track: AudioTrack) -> String {
-        "my_songs_\(track.ownerID)_\(track.id)"
-    }
-
-    private func isNowPlayingTrack(_ track: AudioTrack) -> Bool {
-        guard let np = playerStore.nowPlayingTrack else { return false }
-        return np.id == track.id && np.ownerID == track.ownerID
-    }
-
-    private func scrollNowPlayingRowIntoView(using proxy: ScrollViewProxy) {
-        guard let np = playerStore.nowPlayingTrack else { return }
-        guard authStore.tracks.contains(where: { $0.id == np.id && $0.ownerID == np.ownerID }) else {
-            return
-        }
-        let targetId = mySongsRowId(np)
-        DispatchQueue.main.async {
-            withAnimation(.easeInOut(duration: 0.25)) {
-                proxy.scrollTo(targetId, anchor: .center)
             }
         }
     }
