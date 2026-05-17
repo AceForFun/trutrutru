@@ -956,6 +956,7 @@ private func formatPlaybackSeconds(_ seconds: Double) -> String {
 
 private struct NowPlayingControlsView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @ObservedObject var authStore: VKAuthStore
     @ObservedObject var playerStore: AudioPlayerStore
     @ObservedObject var playbackProgress: PlaybackProgressModel
     var showDownloadToCache: Bool = true
@@ -973,10 +974,7 @@ private struct NowPlayingControlsView: View {
                             .font(.headline)
                             .lineLimit(usesCompactControls ? 1 : 2)
                             .multilineTextAlignment(.leading)
-                        Text(track.artist)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
+                        artistLink(for: track)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -1064,6 +1062,32 @@ private struct NowPlayingControlsView: View {
             playerStore.repeatOne ? "Повтор одного трека включён. Нажмите, чтобы выключить." : "Повтор одного трека выключен. Нажмите, чтобы включить."
         )
     }
+
+    @ViewBuilder
+    private func artistLink(for track: AudioTrack) -> some View {
+        let artist = track.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        if artist.isEmpty {
+            Text(track.artist)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+        } else {
+            NavigationLink {
+                SearchTracksView(
+                    authStore: authStore,
+                    playerStore: playerStore,
+                    initialQuery: artist
+                )
+            } label: {
+                Text(track.artist)
+                    .font(.subheadline)
+                    .foregroundColor(.accentColor)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Искать исполнителя \(track.artist)")
+        }
+    }
 }
 
 private struct NowPlayingChromeBar<Content: View>: View {
@@ -1082,96 +1106,110 @@ private struct NowPlayingChromeBar<Content: View>: View {
 private struct SearchTracksView: View {
     @ObservedObject var authStore: VKAuthStore
     @ObservedObject var playerStore: AudioPlayerStore
+    var initialQuery: String? = nil
 
-    @State private var query = ""
+    @State private var query: String
     @State private var results: [AudioTrack] = []
     @State private var isSearching = false
     @State private var searchError: String?
     @State private var addingKeys: Set<String> = []
+    @State private var pendingInitialSearch: Bool
+
+    init(
+        authStore: VKAuthStore,
+        playerStore: AudioPlayerStore,
+        initialQuery: String? = nil
+    ) {
+        self.authStore = authStore
+        self.playerStore = playerStore
+        self.initialQuery = initialQuery
+        let trimmed = initialQuery?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        _query = State(initialValue: trimmed)
+        _pendingInitialSearch = State(initialValue: !trimmed.isEmpty)
+    }
 
     private var keysInLibrary: Set<String> {
         Set(authStore.tracks.map(trackLibrarySimilarityKey))
     }
 
     var body: some View {
-        Group {
-            if isSearching {
-                ProgressView("Ищем…")
-                    .frame(maxHeight: .infinity)
-            } else if let searchError {
-                ScrollView {
-                    Text(searchError)
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding()
-                }
-            } else if results.isEmpty {
-                Spacer(minLength: 0)
-                Text("Введите запрос и нажмите кнопку поиска справа.")
-                    .multilineTextAlignment(.center)
-                    .foregroundColor(.secondary)
-                    .padding()
-                Spacer(minLength: 0)
-            } else {
-                List(results, id: \.self) { track in
-                    searchRow(for: track)
-                }
-                .listStyle(InsetGroupedListStyle())
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .navigationTitle("Поиск")
-        .navigationBarTitleDisplayMode(.inline)
-        .safeAreaInset(edge: .top, spacing: 0) {
+        VStack(spacing: 0) {
             if playerStore.nowPlayingChrome == .search {
                 NowPlayingChromeBar {
                     NowPlayingControlsView(
+                        authStore: authStore,
                         playerStore: playerStore,
                         playbackProgress: playerStore.playbackProgress,
                         showDownloadToCache: false
                     )
                 }
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                if let playerError = playerStore.playerError {
-                    Text(playerError)
-                        .font(.footnote)
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                        .padding(.vertical, 8)
-                        .frame(maxWidth: .infinity)
-                }
 
-                HStack(spacing: 12) {
-                    TextField("Поиск в VK", text: $query)
-                        .textFieldStyle(.roundedBorder)
-#if os(iOS)
-                        .submitLabel(.search)
-#endif
-                        .onSubmit {
-                            runSearch()
-                        }
-
-                    Button(action: runSearch) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.title3)
-                            .foregroundColor(Color.accentColor)
-                    }
-                    .disabled(trimmedQuery.isEmpty || isSearching)
-                    .accessibilityLabel("Искать")
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 12)
+            if let playerError = playerStore.playerError {
+                Text(playerError)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.red.opacity(0.08))
             }
-            .frame(maxWidth: .infinity)
-            .background(.thinMaterial)
+
+            Group {
+                if isSearching {
+                    ProgressView("Ищем…")
+                        .frame(maxHeight: .infinity)
+                } else if let searchError {
+                    ScrollView {
+                        Text(searchError)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding()
+                    }
+                } else if results.isEmpty {
+                    Spacer(minLength: 0)
+                    Text("Введите запрос и нажмите кнопку поиска внизу.")
+                        .multilineTextAlignment(.center)
+                        .foregroundColor(.secondary)
+                        .padding()
+                    Spacer(minLength: 0)
+                } else {
+                    List(results, id: \.self) { track in
+                        searchRow(for: track)
+                    }
+                    .listStyle(InsetGroupedListStyle())
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .navigationTitle("Поиск")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .bottomBar) {
+                TextField("Поиск в VK", text: $query)
+                    .textFieldStyle(.roundedBorder)
+#if os(iOS)
+                    .submitLabel(.search)
+#endif
+                    .onSubmit {
+                        runSearch()
+                    }
+
+                Button(action: runSearch) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title3)
+                }
+                .disabled(trimmedQuery.isEmpty || isSearching)
+                .accessibilityLabel("Искать")
+            }
         }
         .onAppear {
             playerStore.hidePlaybackChrome()
+            if pendingInitialSearch {
+                pendingInitialSearch = false
+                runSearch()
+            }
         }
         .onDisappear {
             playerStore.hidePlaybackChrome()
@@ -1380,7 +1418,9 @@ struct ContentView: View {
                                     : "Скрыть панель плеера"
                             )
 
-                            NavigationLink(destination: SearchTracksView(authStore: authStore, playerStore: playerStore)) {
+                            NavigationLink {
+                                SearchTracksView(authStore: authStore, playerStore: playerStore)
+                            } label: {
                                 Image(systemName: "magnifyingglass")
                             }
                             .accessibilityLabel("Поиск")
@@ -1445,40 +1485,41 @@ struct ContentView: View {
     }
 
     private var songsView: some View {
-        Group {
-            if authStore.isLoading {
-                ProgressView("Загружаем песни...")
-            } else if let error = authStore.errorMessage {
-                VStack(spacing: 16) {
-                    Text(error)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                    Button("Повторить") {
-                        authStore.fetchTracks()
-                    }
-                }
-            } else if authStore.tracks.isEmpty {
-                Text("Список песен пуст.")
-            } else {
-                MySongsTrackListView(
-                    authStore: authStore,
-                    trackListSnapshot: playerStore.trackListSnapshot,
-                    playerStore: playerStore
-                )
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .safeAreaInset(edge: .top, spacing: 0) {
+        VStack(spacing: 0) {
             if playerStore.nowPlayingChrome == .mySongs && !isNowPlayingControlsHidden {
                 NowPlayingChromeBar {
                     NowPlayingControlsView(
+                        authStore: authStore,
                         playerStore: playerStore,
                         playbackProgress: playerStore.playbackProgress
                     )
                 }
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
+
+            Group {
+                if authStore.isLoading {
+                    ProgressView("Загружаем песни...")
+                } else if let error = authStore.errorMessage {
+                    VStack(spacing: 16) {
+                        Text(error)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                        Button("Повторить") {
+                            authStore.fetchTracks()
+                        }
+                    }
+                } else if authStore.tracks.isEmpty {
+                    Text("Список песен пуст.")
+                } else {
+                    MySongsTrackListView(
+                        authStore: authStore,
+                        trackListSnapshot: playerStore.trackListSnapshot,
+                        playerStore: playerStore
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
             if let playerError = playerStore.playerError {
                 Text(playerError)
                     .font(.footnote)
