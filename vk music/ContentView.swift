@@ -13,6 +13,9 @@ struct AudioTrack: Codable, Identifiable, Hashable {
     let url: String?
     let accessKey: String?
 
+    /// Уникальный id строки списка (audio_id может совпадать у разных owner_id).
+    var listRowId: String { "\(ownerID)_\(id)" }
+
     enum CodingKeys: String, CodingKey {
         case id
         case ownerID = "owner_id"
@@ -61,6 +64,7 @@ final class VKAuthStore: ObservableObject {
     @Published var accessToken: String = ""
     @Published var tracks: [AudioTrack] = []
     @Published var isLoading = false
+    @Published var isRefreshing = false
     @Published var errorMessage: String?
     @Published var deletingTrackIDs: Set<Int> = []
 
@@ -88,17 +92,26 @@ final class VKAuthStore: ObservableObject {
         errorMessage = nil
     }
 
-    func fetchTracks() {
+    func fetchTracks(showFullScreenLoading: Bool = true, completion: (() -> Void)? = nil) {
         guard !accessToken.isEmpty else {
+            completion?()
             return
         }
 
-        isLoading = true
+        if showFullScreenLoading {
+            isLoading = true
+        } else {
+            isRefreshing = true
+        }
 
         fetchTracksPage(offset: 0, accumulated: []) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self = self else {
+                    completion?()
+                    return
+                }
                 self.isLoading = false
+                self.isRefreshing = false
                 switch result {
                 case .success(let allTracks):
                     self.tracks = allTracks
@@ -107,6 +120,16 @@ final class VKAuthStore: ObservableObject {
                 case .failure(let err):
                     self.errorMessage = err.message
                 }
+                completion?()
+            }
+        }
+    }
+
+    @MainActor
+    func refreshTracks() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            fetchTracks(showFullScreenLoading: false) {
+                continuation.resume()
             }
         }
     }
@@ -428,13 +451,17 @@ final class AudioPlayerStore: ObservableObject {
     private var itemEndObservers: [NSObjectProtocol] = []
     private var itemStatusObservations: [NSKeyValueObservation] = []
     private var currentItemObserver: NSKeyValueObservation?
+    private var interruptionObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
+    private var didEnterBackgroundObserver: NSObjectProtocol?
 
     /// Для повтора одного трека и финала плейлиста — обновление UI/seek на main после остановки.
     private var advanceTrackBackgroundTask = UIBackgroundTaskIdentifier.invalid
 
     init() {
-        setupAudioSession()
+        activateAudioSession()
         configureRemoteTransportControls()
+        observeAudioSessionNotifications()
     }
 
     private func syncTrackListPlaybackSnapshot() {
@@ -445,16 +472,77 @@ final class AudioPlayerStore: ObservableObject {
         )
     }
 
-    private func setupAudioSession() {
+    func ensureAudioSessionActive() {
+        activateAudioSession()
+    }
+
+    private func activateAudioSession() {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             print("Ошибка настройки AVAudioSession: \(error)")
         }
     }
 
+    private func observeAudioSessionNotifications() {
+        let session = AVAudioSession.sharedInstance()
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAudioSessionInterruption(notification)
+        }
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: session,
+            queue: .main
+        ) { [weak self] _ in
+            self?.activateAudioSession()
+        }
+        didEnterBackgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.activateAudioSession()
+            if self?.isPlaying == true {
+                self?.queuePlayer?.play()
+            }
+        }
+    }
+
+    private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+        switch type {
+        case .began:
+            break
+        case .ended:
+            let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+            activateAudioSession()
+            if options.contains(.shouldResume), isPlaying {
+                queuePlayer?.play()
+                updateNowPlayingInfo()
+            }
+        @unknown default:
+            break
+        }
+    }
+
     deinit {
+        if let observer = interruptionObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = routeChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = didEnterBackgroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         releasePlayerResources()
     }
 
@@ -827,6 +915,7 @@ final class AudioPlayerStore: ObservableObject {
     }
 
     func play() {
+        activateAudioSession()
         queuePlayer?.play()
         isPlaying = true
         updateNowPlayingInfo()
@@ -954,12 +1043,36 @@ private func formatPlaybackSeconds(_ seconds: Double) -> String {
     return String(format: "%02d:%02d", m, s)
 }
 
+/// Программный переход на поиск по исполнителю (без NavigationLink внутри часто обновляемого плеера).
+private struct ArtistSearchNavigationLink: View {
+    @Binding var query: String?
+    @ObservedObject var authStore: VKAuthStore
+    @ObservedObject var playerStore: AudioPlayerStore
+
+    var body: some View {
+        NavigationLink(
+            destination: SearchTracksView(
+                authStore: authStore,
+                playerStore: playerStore,
+                initialQuery: query ?? ""
+            ),
+            isActive: Binding(
+                get: { query != nil },
+                set: { if !$0 { query = nil } }
+            ),
+            label: { EmptyView() }
+        )
+        .hidden()
+    }
+}
+
 private struct NowPlayingControlsView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ObservedObject var authStore: VKAuthStore
     @ObservedObject var playerStore: AudioPlayerStore
     @ObservedObject var playbackProgress: PlaybackProgressModel
     var showDownloadToCache: Bool = true
+    var onArtistSearch: ((String) -> Void)? = nil
 
     private var usesCompactControls: Bool {
         horizontalSizeClass == .compact
@@ -1072,12 +1185,8 @@ private struct NowPlayingControlsView: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
         } else {
-            NavigationLink {
-                SearchTracksView(
-                    authStore: authStore,
-                    playerStore: playerStore,
-                    initialQuery: artist
-                )
+            Button {
+                onArtistSearch?(artist)
             } label: {
                 Text(track.artist)
                     .font(.subheadline)
@@ -1114,6 +1223,7 @@ private struct SearchTracksView: View {
     @State private var searchError: String?
     @State private var addingKeys: Set<String> = []
     @State private var pendingInitialSearch: Bool
+    @State private var artistSearchQuery: String?
 
     init(
         authStore: VKAuthStore,
@@ -1140,7 +1250,8 @@ private struct SearchTracksView: View {
                         authStore: authStore,
                         playerStore: playerStore,
                         playbackProgress: playerStore.playbackProgress,
-                        showDownloadToCache: false
+                        showDownloadToCache: false,
+                        onArtistSearch: { artistSearchQuery = $0 }
                     )
                 }
             }
@@ -1175,8 +1286,10 @@ private struct SearchTracksView: View {
                         .padding()
                     Spacer(minLength: 0)
                 } else {
-                    List(results, id: \.self) { track in
-                        searchRow(for: track)
+                    List {
+                        ForEach(results, id: \.listRowId) { track in
+                            searchRow(for: track)
+                        }
                     }
                     .listStyle(InsetGroupedListStyle())
                 }
@@ -1186,23 +1299,34 @@ private struct SearchTracksView: View {
         .navigationTitle("Поиск")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItemGroup(placement: .bottomBar) {
-                TextField("Поиск в VK", text: $query)
-                    .textFieldStyle(.roundedBorder)
+            ToolbarItem(placement: .bottomBar) {
+                HStack(spacing: 8) {
+                    TextField("Поиск в VK", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: .infinity)
 #if os(iOS)
-                    .submitLabel(.search)
+                        .submitLabel(.search)
 #endif
-                    .onSubmit {
-                        runSearch()
-                    }
+                        .onSubmit {
+                            runSearch()
+                        }
 
-                Button(action: runSearch) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.title3)
+                    Button(action: runSearch) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.title3)
+                    }
+                    .disabled(trimmedQuery.isEmpty || isSearching)
+                    .accessibilityLabel("Искать")
                 }
-                .disabled(trimmedQuery.isEmpty || isSearching)
-                .accessibilityLabel("Искать")
+                .frame(maxWidth: .infinity)
             }
+        }
+        .background {
+            ArtistSearchNavigationLink(
+                query: $artistSearchQuery,
+                authStore: authStore,
+                playerStore: playerStore
+            )
         }
         .onAppear {
             playerStore.hidePlaybackChrome()
@@ -1317,9 +1441,10 @@ private struct MySongsTrackListView: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            List(authStore.tracks) { track in
-                let playing = trackListSnapshot.isPlayingRow(track)
-                HStack {
+            List {
+                ForEach(authStore.tracks, id: \.listRowId) { track in
+                    let playing = trackListSnapshot.isPlayingRow(track)
+                    HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(track.title)
                             .font(.headline)
@@ -1360,9 +1485,13 @@ private struct MySongsTrackListView: View {
                         ? Color.accentColor.opacity(0.12)
                         : nil
                 )
-                .id(mySongsRowId(track))
+                    .id(mySongsRowId(track))
+                }
             }
             .listStyle(InsetGroupedListStyle())
+            .refreshable {
+                await authStore.refreshTracks()
+            }
             .onChange(of: scenePhase) { phase in
                 if phase == .active {
                     scrollNowPlayingRowIntoView(using: proxy)
@@ -1391,10 +1520,12 @@ private struct MySongsTrackListView: View {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var authStore = VKAuthStore()
     @StateObject private var playerStore = AudioPlayerStore()
     @State private var isAuthWebViewPresented = false
     @State private var isNowPlayingControlsHidden = false
+    @State private var artistSearchQuery: String?
 
     var body: some View {
         NavigationView {
@@ -1439,6 +1570,11 @@ struct ContentView: View {
         .onAppear {
             if !authStore.accessToken.isEmpty && authStore.tracks.isEmpty {
                 authStore.fetchTracks()
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .background || phase == .inactive {
+                playerStore.ensureAudioSessionActive()
             }
         }
     }
@@ -1491,7 +1627,8 @@ struct ContentView: View {
                     NowPlayingControlsView(
                         authStore: authStore,
                         playerStore: playerStore,
-                        playbackProgress: playerStore.playbackProgress
+                        playbackProgress: playerStore.playbackProgress,
+                        onArtistSearch: { artistSearchQuery = $0 }
                     )
                 }
             }
@@ -1530,6 +1667,13 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
                     .background(.thinMaterial)
             }
+        }
+        .background {
+            ArtistSearchNavigationLink(
+                query: $artistSearchQuery,
+                authStore: authStore,
+                playerStore: playerStore
+            )
         }
     }
 }
